@@ -35,10 +35,6 @@ from .operators.attention import MojoSWA
 from .operators.attention import MojoPrefillSageGQA
 from .operators.attention import MojoPagedPrefillSageGQA
 from .operators.attention import MojoPagedPrefillSageSWA
-from .operators.attention import MojoPagedDecodeQuantGQA
-from .operators.attention import MojoPagedPrefillQuantGQA
-from .operators.attention import MojoPagedDecodeQuantSWA
-from .operators.attention import MojoPagedPrefillQuantSWA
 from .operators.attention import MojoPagedDecodeGQAWithKVDequant
 from .operators.attention import MojoPagedPrefillGQAWithKVDequant
 from .operators.attention import MojoPagedDecodeSWAWithKVDequant

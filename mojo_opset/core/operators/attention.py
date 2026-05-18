@@ -2702,11 +2702,11 @@ class MojoPagedPrefillSageSWA(MojoOperator):
             softmax_scale = 1.0 / (head_dim**0.5)
 
         total_seq_lens = _seq_lens_from_cu(cu_q_lens) if cu_total_seq_lens is None else _seq_lens_from_cu(cu_total_seq_lens)
+        o = torch.empty_like(query)
         # per-token quant
         query, query_scale = quant_int8(query, quant_dims=(-1,), q_max=self.q_max, q_min=self.q_min)
         key_cache, key_cache_scale = quant_int8(key_cache, quant_dims=(-1,), q_max=self.q_max, q_min=self.q_min)
 
-        o = torch.empty_like(query)
         bsz = cu_q_lens.shape[0] - 1
         for i in range(bsz):
             q_i = query[cu_q_lens[i] : cu_q_lens[i + 1]]
