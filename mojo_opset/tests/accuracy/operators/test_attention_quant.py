@@ -1,4 +1,5 @@
 import math
+
 from typing import Optional
 
 import pytest
@@ -35,12 +36,13 @@ def _quantize_query(
     else:
         assert query_dtype == torch.bfloat16
         return query.to(query_dtype), None
-    
+
     query_f = query.float()
     amax = query_f.abs().amax(dim=-1, keepdim=True)  # -> [num_tokens, num_q_heads, 1]
     qscale = (amax / qmax).clamp(min=1e-5)
     quant = torch.round(query_f / qscale).clamp(qmin, qmax).to(int_dtype)
     return quant, qscale.to(torch.bfloat16)
+
 
 def _quantize_kv_cache(
     cache: torch.Tensor,  # [n_blocks, n_kv_heads, block_size, head_dim] in float dtype
@@ -139,9 +141,7 @@ def generate_paged_prefill_quant_data(
         cu_total_seq_lens = None
         kv_lens = q_lens
     else:
-        kv_cache_lens = torch.randint(
-            max_kv_computed_len // 2, max_kv_computed_len, (batch_size,), dtype=torch.int32
-        )
+        kv_cache_lens = torch.randint(max_kv_computed_len // 2, max_kv_computed_len, (batch_size,), dtype=torch.int32)
         kv_cache_lens = _make_varlen_positive_int32(kv_cache_lens, max_kv_computed_len)
         kv_lens = q_lens + kv_cache_lens
         kv_lens = torch.where(q_lens > 0, kv_lens, torch.zeros_like(kv_lens))
@@ -226,11 +226,12 @@ test_configs_prefill_gqa_with_kv_dequant = [
     ],
 )
 @pytest.mark.parametrize("gqa_layout", ["ABAB", "AABB"])
-@pytest.mark.parametrize("query_dtype, context_dtype, compute_dtype", 
+@pytest.mark.parametrize(
+    "query_dtype, context_dtype, compute_dtype",
     [
         (torch.bfloat16, torch.int8, torch.bfloat16),
         (torch.bfloat16, torch.int8, torch.int8),
-    ]
+    ],
 )
 @auto_switch_platform()
 @bypass_not_implemented
@@ -325,11 +326,12 @@ test_configs_decode_gqa_with_kv_dequant = [
     ],
 )
 @pytest.mark.parametrize("gqa_layout", ["ABAB", "AABB"])
-@pytest.mark.parametrize("query_dtype, context_dtype, compute_dtype", 
+@pytest.mark.parametrize(
+    "query_dtype, context_dtype, compute_dtype",
     [
         (torch.bfloat16, torch.int8, torch.bfloat16),
         (torch.bfloat16, torch.int8, torch.int8),
-    ]
+    ],
 )
 @auto_switch_platform()
 @bypass_not_implemented
@@ -437,11 +439,12 @@ test_configs_prefill_swa_with_kv_dequant = [
         ("AABB", 4, 1023),
     ],
 )
-@pytest.mark.parametrize("query_dtype, context_dtype, compute_dtype", 
+@pytest.mark.parametrize(
+    "query_dtype, context_dtype, compute_dtype",
     [
         (torch.bfloat16, torch.int8, torch.bfloat16),
         (torch.bfloat16, torch.int8, torch.int8),
-    ]
+    ],
 )
 @auto_switch_platform()
 @bypass_not_implemented
@@ -467,7 +470,7 @@ def test_paged_prefill_swa_with_kv_dequant(
 
     op = MojoPagedPrefillSWAWithKVDequant(
         is_causal=True,
-        gqa_layout=gqa_layout,  
+        gqa_layout=gqa_layout,
         local_window_size=local_window,
         global_window_size=global_window,
         query_dtype=query_dtype,
@@ -549,11 +552,12 @@ test_configs_decode_swa_with_kv_dequant = [
         ("AABB", 4, 1023),
     ],
 )
-@pytest.mark.parametrize("query_dtype, context_dtype, compute_dtype", 
+@pytest.mark.parametrize(
+    "query_dtype, context_dtype, compute_dtype",
     [
         (torch.bfloat16, torch.int8, torch.bfloat16),
         (torch.bfloat16, torch.int8, torch.int8),
-    ]
+    ],
 )
 @auto_switch_platform()
 @bypass_not_implemented
