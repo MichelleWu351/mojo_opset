@@ -85,9 +85,19 @@ def _swizzle_weights_post_hook(module, incompatible_keys):
 class IxformerMoEGating(MojoMoEGating):
     supported_platforms_list = ["ilu"]
 
+    def __init__(self, hidden_size: int, num_experts: int, top_k: int, **kwargs):
+        super().__init__(hidden_size, num_experts, top_k, **kwargs)
+        self.register_load_state_dict_post_hook(self._transform_gate_weight_post_hook)
+
+    @staticmethod
+    def _transform_gate_weight_post_hook(module, incompatible_keys):
+        device = module.gate_weight.device
+        gate_weight_tn = module.gate_weight.data.T.contiguous()
+        module.gate_weight = torch.nn.Parameter(gate_weight_tn.to(device=device, dtype=torch.float32))
+
     def forward(self, hidden_states: torch.Tensor):
         assert self.gate_weight.dtype == torch.float32
-        gate_logits = ixf_f.mixed_type_linear(hidden_states, self.gate_weight, format="NN")
+        gate_logits = ixf_f.mixed_type_linear(hidden_states, self.gate_weight)
         top_k_gates, top_k_indices = ixf_f.moe_topk_softmax(gate_logits, self.top_k, renormalize=True)
 
         return top_k_indices, top_k_gates
