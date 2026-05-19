@@ -11,9 +11,18 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from mojo_opset import MojoGemm
+from mojo_opset import MojoGroupedMatmul
+from mojo_opset import MojoFunctionalDequantSwiGLUQuant
+from mojo_opset import MojoFormatCast
 from mojo_opset import MojoHcPost
 from mojo_opset import MojoHcPre
 from mojo_opset import MojoInplacePartialRotaryMul
+from mojo_opset import MojoMoEDistributeCombineV2
+from mojo_opset import MojoMoEDistributeDispatchV2
+from mojo_opset import MojoMoEFinalizeRouting
+from mojo_opset import MojoMoEInitRoutingV2
+from mojo_opset import MojoMoEReRouting
+from mojo_opset import MojoQuantMatmul
 from mojo_opset import MojoQuantGemm
 from mojo_opset import MojoQuantLightningIndexer
 from mojo_opset import MojoQuantLightningIndexerMetadata
@@ -30,6 +39,7 @@ from mojo_opset import MojoSparseAttnSharedkvMetadata
 
 
 _INPLACE_PARTIAL_ROTARY_MUL = MojoInplacePartialRotaryMul()
+_DYNAMIC_QUANT_PER_TOKEN = MojoDynamicQuant()
 
 
 def _get_had_pow2(n: int, norm: bool = True, device: Optional[torch.device] = None) -> torch.Tensor:
@@ -216,6 +226,7 @@ class PagedDummyCache:
         self.free_blocks = torch.arange(total_blocks, device=self.device, dtype=torch.int32)
         self.num_free_blocks = total_blocks
         self.scatter_nd_update = MojoScatterNdUpdateAsc()
+        self.li_dynamic_quant = MojoDynamicQuant()
 
         self.cache_data = {}
         for layer_idx in range(self.num_layers):
@@ -589,8 +600,8 @@ class PagedDummyCache:
             return
         batch_size, seq_len, _ = kv.shape
         kv_flat = kv.reshape(-1, self.index_head_dim).contiguous()
-        kv_quant, k_scale = torch_npu.npu_dynamic_quant(kv_flat)
-        k_scale = k_scale.to(torch.float16)
+        kv_quant, k_scale = self.li_dynamic_quant(kv_flat)
+        k_scale = k_scale.squeeze(-1).to(torch.float16)
         cmp_flat = li_cmp_cache.view(-1, self.index_head_dim)
         scale_flat = scale_cache.view(-1, scale_cache.shape[-1])
         if slot_mapping is not None:
@@ -828,6 +839,7 @@ class DeepseekV4Indexer(nn.Module):
         self.compress_rotary_emb = DeepseekV4RotaryEmbedding(config, base=config.compress_rope_theta)
         self.quant_lightning_indexer_metadata = MojoQuantLightningIndexerMetadata()
         self.quant_lightning_indexer = MojoQuantLightningIndexer()
+        self.query_dynamic_quant = MojoDynamicQuant()
         self.register_buffer("hadamard_matrix", _get_had_pow2(self.head_dim), persistent=False)
 
     def forward(self, x, qr, cos, sin, past_key_values=None, layer_idx=0,
@@ -896,8 +908,8 @@ class DeepseekV4Indexer(nn.Module):
             c4a_block_table = past_key_values.get_c4a_cmp_kv_block_table(layer_idx)
 
             q_flat = q.flatten(0, 1)
-            q_quant, q_scale = torch_npu.npu_dynamic_quant(q_flat)
-            q_scale = q_scale.to(torch.float16)
+            q_quant, q_scale = self.query_dynamic_quant(q_flat)
+            q_scale = q_scale.squeeze(-1).to(torch.float16)
 
             actual_seq_q = cu_seqlens_q[1:] if cu_seqlens_q is not None else torch.tensor([seq_len], dtype=torch.int32, device=x.device)
             actual_seq_k = seq_lens if seq_lens is not None else torch.tensor([seq_len], dtype=torch.int32, device=x.device)
@@ -938,7 +950,8 @@ class DeepseekV4Indexer(nn.Module):
 
 
 def _dynamic_quant_per_token(x: torch.Tensor):
-    return torch_npu.npu_dynamic_quant(x)
+    quant, scale = _DYNAMIC_QUANT_PER_TOKEN(x)
+    return quant, scale.squeeze(-1)
 
 
 class DeepseekV4Attention(nn.Module):
@@ -1390,6 +1403,8 @@ class DeepseekV4SharedExpert(nn.Module):
         self.gate_quant = MojoDynamicQuant(input_size=self.hidden_size)
         self.up_quant = MojoDynamicQuant(input_size=self.hidden_size)
         self.intermediate_quant = MojoDynamicQuant(input_size=self.intermediate_size)
+        self.quant_matmul = MojoQuantMatmul()
+        self.dequant_swiglu_quant = MojoFunctionalDequantSwiGLUQuant()
         nn.init.ones_(self.gate_quant.inv_smooth_scale)
         nn.init.ones_(self.up_quant.inv_smooth_scale)
         nn.init.ones_(self.intermediate_quant.inv_smooth_scale)
@@ -1403,7 +1418,7 @@ class DeepseekV4SharedExpert(nn.Module):
         gate_up_weight_scale = torch.cat(
             (self.gate_proj.weight_scale, self.up_proj.weight_scale), dim=0
         ).contiguous()
-        merged_x = torch_npu.npu_quant_matmul(
+        merged_x = self.quant_matmul(
             x_quant,
             gate_up_weight,
             gate_up_weight_scale.view(-1).float(),
@@ -1422,7 +1437,7 @@ class DeepseekV4SharedExpert(nn.Module):
                     "glu_bias": 0,
                 }
             )
-        intermediate_quant, intermediate_scale = torch_npu.npu_dequant_swiglu_clamp_quant(
+        intermediate_quant, intermediate_scale = self.dequant_swiglu_quant(
             merged_x,
             weight_scale=gate_up_weight_scale.view(-1).float(),
             quant_scale=self.intermediate_quant.inv_smooth_scale.to(dtype=torch.float32),
@@ -1473,6 +1488,15 @@ class DeepseekV4MoE(nn.Module):
             weight_dtype=torch.int8,
         )
         self.combine = MojoMoECombine(multiply_by_gates=True)
+        self.dynamic_quant = MojoDynamicQuant()
+        self.grouped_matmul = MojoGroupedMatmul()
+        self.dequant_swiglu_quant = MojoFunctionalDequantSwiGLUQuant()
+        self.format_cast = MojoFormatCast()
+        self.moe_init_routing_v2 = MojoMoEInitRoutingV2()
+        self.moe_re_routing = MojoMoEReRouting()
+        self.moe_finalize_routing = MojoMoEFinalizeRouting()
+        self.moe_distribute_dispatch_v2 = MojoMoEDistributeDispatchV2()
+        self.moe_distribute_combine_v2 = MojoMoEDistributeCombineV2()
         nn.init.ones_(self.experts.up_proj_quantize.inv_smooth_scale)
         nn.init.ones_(self.experts.down_proj_quantize.inv_smooth_scale)
 
@@ -1606,9 +1630,10 @@ class DeepseekV4MoE(nn.Module):
             x = x.view(-1, hidden_size)
 
         if pertoken_scale is None:
-            x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
+            x, pertoken_scale = self.dynamic_quant(x)
+            pertoken_scale = pertoken_scale.squeeze(-1)
 
-        fc1_out = torch_npu.npu_grouped_matmul(
+        fc1_out = self.grouped_matmul(
             [x], [experts_mod.up_proj_weight],
             group_list=expert_tokens,
             split_item=3,
@@ -1618,7 +1643,7 @@ class DeepseekV4MoE(nn.Module):
             tuning_config=[0],
         )[0]
 
-        intermediate_h, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
+        intermediate_h, pertoken_scale = self.dequant_swiglu_quant(
             fc1_out,
             weight_scale=experts_mod.up_proj_weight_scale,
             quant_scale=self.smooth_scale_2,
@@ -1628,7 +1653,7 @@ class DeepseekV4MoE(nn.Module):
             activation_scale=pertoken_scale,
         )
 
-        fc2_out = torch_npu.npu_grouped_matmul(
+        fc2_out = self.grouped_matmul(
             [intermediate_h], [experts_mod.down_proj_weight],
             scale=[experts_mod.down_proj_weight_scale],
             per_token_scale=[pertoken_scale],
@@ -1649,8 +1674,8 @@ class DeepseekV4MoE(nn.Module):
         experts_mod.up_proj_weight.data = experts_mod.up_proj_weight.data.transpose(1, 2).contiguous()
         experts_mod.down_proj_weight.data = experts_mod.down_proj_weight.data.transpose(1, 2).contiguous()
         torch_npu.npu.config.allow_internal_format = True
-        experts_mod.up_proj_weight.data = torch_npu.npu_format_cast(experts_mod.up_proj_weight.data.contiguous(), 29)
-        experts_mod.down_proj_weight.data = torch_npu.npu_format_cast(experts_mod.down_proj_weight.data.contiguous(), 29)
+        experts_mod.up_proj_weight.data = self.format_cast(experts_mod.up_proj_weight.data.contiguous(), 29)
+        experts_mod.down_proj_weight.data = self.format_cast(experts_mod.down_proj_weight.data.contiguous(), 29)
         experts_mod.up_proj_weight_scale.data = experts_mod.up_proj_weight_scale.data.to(torch.float)
         self.smooth_scale_1.data = self.smooth_scale_1.data.to(torch.float)
         self.smooth_scale_2.data = self.smooth_scale_2.data.to(torch.float)
@@ -1660,7 +1685,7 @@ class DeepseekV4MoE(nn.Module):
         n_tokens = hidden_states_flat.shape[0]
 
         expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = \
-            torch_npu.npu_moe_init_routing_v2(
+            self.moe_init_routing_v2(
                 hidden_states_flat,
                 expert_idx=topk_idx,
                 active_num=n_tokens * self.top_k,
@@ -1689,7 +1714,7 @@ class DeepseekV4MoE(nn.Module):
         dist.all_to_all_single(gathered_pertoken_scale, pertoken_scale, output_splits, input_splits, group=moe_ep_group)
 
         hidden_states_ordered, gathered_pertoken_scale, gathered_ids_unsort, tokens_per_local_expert = \
-            torch_npu.npu_moe_re_routing(
+            self.moe_re_routing(
                 gathered_tokens,
                 tokens_per_expert_group.view(self.ep_size, -1),
                 per_token_scales=gathered_pertoken_scale,
@@ -1706,7 +1731,7 @@ class DeepseekV4MoE(nn.Module):
         combined_tokens = new_x.new_empty(expanded_x.shape[0], new_x.shape[1])
         dist.all_to_all_single(combined_tokens, new_x, input_splits, output_splits, group=moe_ep_group)
 
-        routed_out = torch_npu.npu_moe_finalize_routing(
+        routed_out = self.moe_finalize_routing(
             combined_tokens,
             skip1=shared_expert_out,
             skip2=None,
@@ -1722,7 +1747,7 @@ class DeepseekV4MoE(nn.Module):
         if self.dispatch_kwargs is None:
             self.set_mc2_kwargs()
 
-        dispatch_output = torch_npu.npu_moe_distribute_dispatch_v2(
+        dispatch_output = self.moe_distribute_dispatch_v2(
             x=hidden_states_flat,
             expert_ids=topk_idx,
             **self.dispatch_kwargs,
@@ -1745,7 +1770,7 @@ class DeepseekV4MoE(nn.Module):
         if tp_recv_counts is not None:
             combine_input["tp_send_counts"] = tp_recv_counts
 
-        routed_out = torch_npu.npu_moe_distribute_combine_v2(
+        routed_out = self.moe_distribute_combine_v2(
             **combine_input,
             **self.combine_kwargs,
         )

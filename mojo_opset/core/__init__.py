@@ -70,6 +70,15 @@ from .operators.quantize import MojoDequantSwiGLUQuant
 from .operators.quantize import MojoDynamicQuant
 from .operators.quantize import MojoMoEDynamicQuant
 from .operators.quantize import MojoStaticQuant
+from .operators.npu_ops import MojoFormatCast
+from .operators.npu_ops import MojoFunctionalDequantSwiGLUQuant
+from .operators.npu_ops import MojoGroupedMatmul
+from .operators.npu_ops import MojoMoEDistributeCombineV2
+from .operators.npu_ops import MojoMoEDistributeDispatchV2
+from .operators.npu_ops import MojoMoEFinalizeRouting
+from .operators.npu_ops import MojoMoEInitRoutingV2
+from .operators.npu_ops import MojoMoEReRouting
+from .operators.npu_ops import MojoQuantMatmul
 
 """ moe """
 from .operators.moe import MojoExperts
@@ -203,6 +212,15 @@ __all__ = [
     "MojoDynamicQuant",
     "MojoMoEDynamicQuant",
     "MojoDequantSwiGLUQuant",
+    "MojoQuantMatmul",
+    "MojoFunctionalDequantSwiGLUQuant",
+    "MojoGroupedMatmul",
+    "MojoFormatCast",
+    "MojoMoEInitRoutingV2",
+    "MojoMoEReRouting",
+    "MojoMoEFinalizeRouting",
+    "MojoMoEDistributeDispatchV2",
+    "MojoMoEDistributeCombineV2",
 
     "MojoEmbedding",
     "MojoParallelEmbedding",
