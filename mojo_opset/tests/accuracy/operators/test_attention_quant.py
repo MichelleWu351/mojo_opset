@@ -8,6 +8,7 @@ from mojo_opset import MojoPagedDecodeGQAWithKVDequant
 from mojo_opset import MojoPagedDecodeSWAWithKVDequant
 from mojo_opset import MojoPagedPrefillGQAWithKVDequant
 from mojo_opset import MojoPagedPrefillSWAWithKVDequant
+from mojo_opset import MojoPagedPrefillSageGQA
 from mojo_opset.tests.utils import auto_switch_platform
 from mojo_opset.tests.utils import bypass_not_implemented
 
@@ -595,4 +596,107 @@ def test_paged_decode_swa_with_kv_dequant(
         softmax_scale=softmax_scale,
         atol=atol,
         rtol=rtol,
+    )
+
+
+# ===========================================================================
+# MojoPagedPrefillSageGQA
+# ===========================================================================
+# NOTE: There is currently no accelerator backend for ``MojoPagedPrefillSageGQA``
+# (only the CPU/torch reference). This minimal test merely exercises the
+# python-level forward path with dynamic per-token int8 quant (query_scale /
+# key_scale / value_scale all None). Once a real backend is registered, this
+# matrix should be expanded similar to ``test_paged_prefill_gqa_with_kv_dequant``
+# above (more shapes, gqa_layout / dtype combinations).
+
+test_configs_prefill_sage_gqa = [
+    (2, 16, 4, 128, 1024, 0, 32, torch.bfloat16, "M_BF16"),
+    (2, 8, 2, 128, 1024, 0, 128, torch.bfloat16, "M_BF16_GROUP"),
+    (2, 8, 1, 128, 512, 1024, 128, torch.bfloat16, "M_BF16_WITH_CACHE"),
+]
+
+
+@pytest.mark.parametrize(
+    "query, k_cache, v_cache, cu_q_lens, block_tables, cu_total_seq_lens, max_q_lens, max_total_seq_lens",
+    [
+        pytest.param(
+            *generate_paged_prefill_quant_data(
+                batch_size=B,
+                num_q_heads=Q_H,
+                num_kv_heads=KV_H,
+                head_dim=D,
+                max_q_len=Q_LEN,
+                max_kv_computed_len=KV_COMPUTED_LEN,
+                block_size=BLK_S,
+                dtype=dtype,
+            ),
+            id=ID,
+        )
+        for B, Q_H, KV_H, D, Q_LEN, KV_COMPUTED_LEN, BLK_S, dtype, ID in test_configs_prefill_sage_gqa
+    ],
+)
+@pytest.mark.parametrize("gqa_layout", ["ABAB", "AABB"])
+@pytest.mark.parametrize(
+    "query_dtype, context_dtype, compute_dtype",
+    [
+        (torch.int8, torch.int8, torch.int8),
+    ],
+)
+@auto_switch_platform()
+@bypass_not_implemented
+def test_paged_prefill_sage_gqa(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_q_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    cu_total_seq_lens: Optional[torch.Tensor],
+    max_q_lens: int,
+    max_total_seq_lens: int,
+    gqa_layout: str,
+    query_dtype: torch.dtype,
+    context_dtype: torch.dtype,
+    compute_dtype: torch.dtype,
+):
+    
+
+    # Sage runs dynamic per-token int8 quant *inside* its forward, so the
+    # caller still passes float K/V cache and ``None`` scales — the dtype
+    # arguments only configure the operator's internal quant matmul path.
+    op = MojoPagedPrefillSageGQA(
+        is_causal=True,
+        gqa_layout=gqa_layout,
+        query_dtype=query_dtype,
+        context_dtype=context_dtype,
+        compute_dtype=compute_dtype,
+    )
+    op_ref = MojoPagedPrefillSageGQA._registry.get("torch")(
+        is_causal=True,
+        gqa_layout=gqa_layout,
+        query_dtype=query_dtype,
+        context_dtype=context_dtype,
+        compute_dtype=compute_dtype,
+    )
+
+    head_dim = query.shape[-1]
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    v_cache_q, value_scale = _quantize_kv_cache(v_cache, context_dtype)
+
+    op.forward_diff_with(
+        op_ref,
+        query,
+        k_cache,
+        v_cache_q,
+        cu_q_lens,
+        block_tables,
+        query_scale=None,
+        key_scale=None,
+        value_scale=value_scale,
+        softmax_scale=softmax_scale,
+        cu_total_seq_lens=cu_total_seq_lens,
+        max_q_lens=max_q_lens,
+        max_total_seq_lens=max_total_seq_lens,
+        atol=2e-2 if query.dtype != torch.float32 else 1e-5,
+        rtol=2e-2 if query.dtype != torch.float32 else 1e-6,
     )

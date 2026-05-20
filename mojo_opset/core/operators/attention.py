@@ -2327,18 +2327,41 @@ class MojoPagedDecodeSWAWithKVDequant(MojoOperator):
             o[i] = o_i.to(o.dtype)
         return o
 
-# sage quant dtype utils, can be reused for other attention implementations
-# assert x.shape == [Batch*Heads, Seq_len, Head_dim]
 def get_scale_and_quant(
     x: torch.Tensor,
     scale: Optional[torch.Tensor],
-    quant_dims,                          # int or tuple/list of int
+    quant_dims,
     q_max: int = 127,
-    q_min: int = -127,                   # symmetric
+    q_min: int = -128,
     eps: float = 1e-6,
     quant_dtype: torch.dtype = torch.int8,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return (q, scale) where scale is broadcastable to x (keepdim layout)."""
+    """Integer quantization helper used by the sage-style ``per_*_int8`` wrappers.
+
+    Computes (or reuses) a per-group scale by reducing ``x.abs()`` along
+    ``quant_dims`` (with ``keepdim=True``), then quantizes ``x`` to
+    ``quant_dtype`` via ``round(x / scale)`` and clamps into ``[q_min, q_max]``.
+
+    Args:
+        x (torch.Tensor): Input tensor in any floating-point dtype.
+        scale (Optional[torch.Tensor]): Pre-computed scale.
+            - ``None``: compute a dynamic scale from ``x``;
+            - keepdim layout (``scale.ndim == x.ndim``): used as-is;
+            - non-keepdim layout: missing reduced dims are restored via ``unsqueeze``
+              so the result is broadcastable to ``x``.
+        quant_dims (int | Tuple[int, ...] | List[int]): Axis (or axes) over which
+            the absolute-max is reduced. Negative indices are accepted.
+        q_max (int): Positive saturation bound, default ``127`` (int8).
+        q_min (int): Negative saturation bound, default ``-128`` (int8).
+        eps (float): Lower clamp on the dynamic scale to avoid division-by-zero.
+        quant_dtype (torch.dtype): Target integer dtype, default ``torch.int8``.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - ``q``: integer tensor with the same shape as ``x`` and dtype
+              ``quant_dtype``.
+            - ``scale``: float tensor broadcastable to ``x`` (keepdim layout).
+    """
     assert scale is None or isinstance(scale, torch.Tensor), \
         f"scale must be None or Tensor, got {type(scale)}"
 
@@ -2355,8 +2378,83 @@ def get_scale_and_quant(
     q = torch.clamp(torch.round(x.float() / scale), q_min, q_max).to(quant_dtype)
     return q, scale
 
-# for per_token, quant_dims should be the D
-# return: x_q: [T, H, D], x_scale: [T, H, 1]
+
+def per_block_int8(
+    x: torch.Tensor,
+    xm: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    *,
+    blk: int = 16,
+    seq_dim: int = -2,
+    q_max: int = 127,
+    q_min: int = -128,
+):
+    """Per-block int8 quantization along the sequence axis.
+
+    Splits ``x`` along ``seq_dim`` into contiguous chunks of size ``blk`` and
+    computes one scale per (chunk, ...remaining dims) by reducing the abs-max
+    inside each chunk. Typical usage in sage-style attention:
+
+    - For the K cache of shape ``[T, H, D]`` and ``blk=128``, this yields one
+      scale per (128-token block, H, D), i.e. scale shape ``[T//blk, 1, H, D]``
+      after broadcasting back to the original layout.
+    - For paged KV of shape ``[N_blocks, H, block_size, D]``, set
+      ``seq_dim=-2`` (the default) and ``blk=block_size`` to obtain one scale
+      per (logical block, H, D).
+
+    Args:
+        x (torch.Tensor): Input tensor whose dimension at ``seq_dim`` is
+            divisible by ``blk``.
+        xm (Optional[torch.Tensor]): Optional zero-point / mean tensor that is
+            subtracted from ``x`` before quantization (broadcastable to ``x``).
+        scale (Optional[torch.Tensor]): Pre-computed scale; same conventions
+            as in :func:`get_scale_and_quant`. ``None`` triggers dynamic
+            per-block scale computation.
+        blk (int): Block size along ``seq_dim``. Default ``16``.
+        seq_dim (int): Axis to split into blocks. Default ``-2``.
+        q_max (int): Positive saturation bound, default ``127``.
+        q_min (int): Negative saturation bound, default ``-128``.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - ``x_q``: int8 tensor with the same shape as ``x``.
+            - ``x_scale``: float scale tensor broadcastable to ``x`` (keepdim
+              layout, with the block axis kept at length ``S // blk``).
+    """
+    if xm is not None:
+        x = x - xm
+
+    seq_dim_norm = seq_dim % x.ndim
+    seq_len = x.shape[seq_dim_norm]
+    assert seq_len % blk == 0, (
+        f"per_block_int8: dim {seq_dim_norm} (size {seq_len}) must be divisible by blk={blk}"
+    )
+
+    # Reshape seq_dim from S into (S // blk, blk) so the inner ``blk`` axis
+    # can be reduced independently.
+    new_shape = (
+        list(x.shape[:seq_dim_norm])
+        + [seq_len // blk, blk]
+        + list(x.shape[seq_dim_norm + 1:])
+    )
+    x_reshaped = x.reshape(new_shape)
+
+    # The reduction axis is the inner ``blk`` axis we just inserted.
+    q, scale_kd = get_scale_and_quant(
+        x_reshaped,
+        scale,
+        quant_dims=seq_dim_norm + 1,
+        q_max=q_max,
+        q_min=q_min,
+    )
+
+    # Restore original layout for q; collapse the inner ``blk`` axis (which is
+    # length 1 after reduction) so scale broadcasts back to the original shape.
+    q = q.reshape(x.shape)
+    scale_out = scale_kd.squeeze(seq_dim_norm + 1)
+    return q, scale_out
+
+
 def per_token_int8(
     x: torch.Tensor,
     xm: Optional[torch.Tensor] = None,
@@ -2365,14 +2463,34 @@ def per_token_int8(
     q_max: int = 127,
     q_min: int = -127,
 ):
-    """Per-token quant: one scale per row along the last dim.
-       Works for any shape ending in D. scale shape == x.shape with last dim = 1."""
+    """Per-token int8 quantization (one scale per row of the last dim).
+
+    Reduces ``abs(x)`` along the last dimension to produce one scale per
+    "token row". Works for any tensor whose last axis is the feature/head-dim
+    axis; e.g. ``x`` of shape ``[T, H, D]`` produces a scale of shape
+    ``[T, H, 1]`` broadcastable back to ``x``.
+
+    Args:
+        x (torch.Tensor): Input tensor of any shape ending in ``D``.
+        xm (Optional[torch.Tensor]): Optional zero-point / mean tensor that is
+            subtracted from ``x`` before quantization (broadcastable to ``x``).
+        scale (Optional[torch.Tensor]): Pre-computed scale; ``None`` triggers
+            dynamic per-token scale computation. See
+            :func:`get_scale_and_quant` for accepted layouts.
+        q_max (int): Positive saturation bound, default ``127``.
+        q_min (int): Negative saturation bound, default ``-127``.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - ``x_q``: int8 tensor with the same shape as ``x``.
+            - ``x_scale``: float scale tensor with the last dim collapsed to
+              ``1`` (keepdim layout), easily to broadcastable. e.g. [T, H, 1].
+    """
     if xm is not None:
         x = x - xm
     return get_scale_and_quant(x, scale, quant_dims=-1, q_max=q_max, q_min=q_min)
 
-# for per_channel, quant_dims should be S
-# return: x_q: [T, H, D], x_scale: [1, H, D]
+
 def per_channel_int8(
     x: torch.Tensor,
     xm: Optional[torch.Tensor] = None,
@@ -2382,6 +2500,38 @@ def per_channel_int8(
     q_max: int = 127,
     q_min: int = -127,
 ):
+    """Per-channel int8 quantization (one scale per (head, dim) channel).
+
+    Reduces ``abs(x)`` along ``seq_dim`` (the sequence/token axis) to produce
+    one scale per non-seq position. For example, ``x`` of shape ``[T, H, D]``
+    with the default ``seq_dim=-2`` (which is ``T`` here once contiguous use
+    is mapped accordingly — see notes below) yields a scale broadcastable to
+    ``[1, H, D]``.
+
+    Args:
+        x (torch.Tensor): Input tensor with an explicit sequence axis.
+        xm (Optional[torch.Tensor]): Optional zero-point / mean tensor that is
+            subtracted from ``x`` before quantization (broadcastable to ``x``).
+        scale (Optional[torch.Tensor]): Pre-computed scale; ``None`` triggers
+            dynamic per-channel scale computation. See
+            :func:`get_scale_and_quant` for accepted layouts.
+        seq_dim (int): Axis to reduce over (the sequence/token axis).
+            Default ``-2``.
+        q_max (int): Positive saturation bound, default ``127``.
+        q_min (int): Negative saturation bound, default ``-127``.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - ``x_q``: int8 tensor with the same shape as ``x``.
+            - ``x_scale``: float scale tensor with ``seq_dim`` collapsed to
+              ``1`` (keepdim layout), broadcastable to ``x``.
+
+    Notes:
+        Callers are expected to pass ``seq_dim`` matching their tensor layout;
+        e.g. for ``[T, H, D]`` with the seq axis at position ``0`` use
+        ``seq_dim=0``, while for ``[B, H, S, D]`` the default ``-2`` already
+        points at ``S``.
+    """
     if xm is not None:
         x = x - xm
     return get_scale_and_quant(x, scale, quant_dims=seq_dim, q_max=q_max, q_min=q_min)
@@ -2392,16 +2542,18 @@ class MojoPagedPrefillSageGQA(MojoOperator):
         self,
         is_causal: bool = True,
         gqa_layout: str = "AABB",
-        quant_granularity: str = "token", # "token" or "block"
-        quant_dtype: torch.dtype = torch.int8,
+        query_dtype: torch.dtype = torch.bfloat16,
+        context_dtype: torch.dtype = torch.int8,
+        compute_dtype: torch.dtype = torch.bfloat16,
     ):
         """
         Initialize the Paged Prefill GQA attention operator with common parameters.
         Parameter descriptions:
         - gqa_layout (str): GQA head grouping layout, values {"ABAB","AABB"}, default "ABAB".
         - is_causal (bool): Whether to enable causal masking, default True.
-        - quant_granularity (str): The quant granularity, values {"block", "token", "channel"}, default "token".
-        - quant_dtype (torch.dtype): The quant dtype, default torch.int8.
+        - query_dtype (torch.dtype): the dtype for query, default torch.bfloat16 for non-quantized query.
+        - context_dtype (torch.dtype): The stored KV-cache dtype before dequantization, default torch.int8.
+        - compute_dtype (torch.dtype): The quant matmul dtype for Q@K and P@V, default torch.bfloat16.       
         """
         super().__init__()
 
@@ -2410,13 +2562,16 @@ class MojoPagedPrefillSageGQA(MojoOperator):
 
         self.is_causal = is_causal
         self.gqa_layout = gqa_layout
-        # sage attention specific parameters
-        assert quant_granularity is "token", f"Unsupported quant granularity {quant_granularity}"
-        if quant_dtype != torch.int8:
-            raise ValueError("quant_dtype must be torch.int8")
-        self.quant_granularity = quant_granularity
-        self.q_max = 127
-        self.q_min = -128
+        self.query_dtype = query_dtype
+        self.context_dtype = context_dtype
+        self.compute_dtype = compute_dtype
+        assert self.query_dtype == torch.int8, f"Unsupported query dtype {self.query_dtype}"
+        assert self.context_dtype == torch.int8, f"Quant attention support int8 context only, but got {self.context_dtype}"
+        assert self.compute_dtype == torch.int8, f"Unsupported compute dtype {self.compute_dtype}"
+        if self.compute_dtype == torch.int8:
+            bits = 8
+            self.qmax = 2 ** (bits - 1) - 1
+            self.qmin = -(2 ** (bits - 1))
 
     def forward(
         self,
@@ -2439,15 +2594,15 @@ class MojoPagedPrefillSageGQA(MojoOperator):
 
         Args:
             query (torch.Tensor): Query tokens of shape (T, Hq, D).
-            query_scale (torch.Tensor): if using per token dynamic quant it should be None, otherwise its shape is (Hq, T) with dtype fp32.
             key_cache (torch.Tensor): Key cache of shape (N_blocks, Hkv, block_size, D).
-            key_scale (torch.Tensor): Key scale for quant, should be None if using per token dynamic quant, otherwise shape is (N_blocks, Hkv, block_size) with dtype fp32.
             value_cache (torch.Tensor): Value cache of shape (N_blocks, Hkv, block_size, D).
-            value_scale (torch.Tensor): Value scale for quant, should be None if using per channel dynamic quant, otherwise shape is [Hkv, D] with dtype fp32.
             cu_q_lens (torch.Tensor): Cumulative query lengths, shape (B+1,);
                 `cu_q_lens[i]` is the start offset for query at batch i; `cu_q_lens[-1] == T`.
             block_tables (torch.Tensor): Logical-to-physical block IDs per batch,
                 shape (B, num_blocks).
+            query_scale (torch.Tensor): if using per token dynamic quant it should be None, otherwise its shape is (T, Hq) with dtype fp32.
+            key_scale (torch.Tensor): Key scale for quant, should be None if using per token dynamic quant, otherwise shape is (N_blocks, Hkv, block_size) with dtype fp32.
+            value_scale (torch.Tensor): Value scale for quant, should be None if using per channel dynamic quant, otherwise shape is [Hkv, D] with dtype fp32.
             softmax_scale (Optional[float]): Attention scaling factor; defaults to 1/sqrt(D).
             cu_total_seq_lens (Optional[torch.Tensor]): Cumulative total KV lengths, shape (B+1,);
                 `cu_total_seq_lens[i+1] - cu_total_seq_lens[i]` is the total visible KV length for batch i.
@@ -2557,10 +2712,9 @@ class MojoPagedPrefillSageGQA(MojoOperator):
             attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
             attn_probs_int8, attn_probs_scale = per_token_int8(x=attn_probs, q_max=self.q_max, q_min=self.q_min)
             v_expanded_int8, v_expanded_scale = per_channel_int8(x=v_expanded, seq_dim=-2, q_max=self.q_max, q_min=self.q_min)
-            # npu don't support int8
             attn_probs_int8, v_expanded_int8 = attn_probs_int8.float(), v_expanded_int8.float()
             outputs[start_loc:end_loc] = torch.einsum("thk,khd->thd", attn_probs_int8, v_expanded_int8) * attn_probs_scale * v_expanded_scale
         return outputs
 
     def extra_repr(self) -> str:
-        return f"{self.is_causal=}, {self.gqa_layout=}, {self.quant_granularity}, {self.q_max=}, {self.q_min=}".replace("self.", "")
+        return f"{self.is_causal=}, {self.gqa_layout=}, {self.query_dtype=}, {self.context_dtype=}, {self.compute_dtype=}, {self.q_max=}, {self.q_min=}".replace("self.", "")
