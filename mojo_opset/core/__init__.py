@@ -70,6 +70,15 @@ from .operators.quantize import MojoDequantSwiGLUQuant
 from .operators.quantize import MojoDynamicQuant
 from .operators.quantize import MojoMoEDynamicQuant
 from .operators.quantize import MojoStaticQuant
+from .operators.npu_ops import MojoFormatCast
+from .operators.npu_ops import MojoFunctionalDequantSwiGLUQuant
+from .operators.npu_ops import MojoGroupedMatmul
+from .operators.npu_ops import MojoMoEDistributeCombineV2
+from .operators.npu_ops import MojoMoEDistributeDispatchV2
+from .operators.npu_ops import MojoMoEFinalizeRouting
+from .operators.npu_ops import MojoMoEInitRoutingV2
+from .operators.npu_ops import MojoMoEReRouting
+from .operators.npu_ops import MojoQuantMatmul
 
 """ moe """
 from .operators.moe import MojoExperts
@@ -126,6 +135,14 @@ from .operators.mlp import MojoSwiGLUMLP
 
 """ indexer """
 from .operators.indexer import MojoLightningIndexer
+from .operators.indexer import MojoQuantLightningIndexer
+from .operators.indexer import MojoIndexerCompressEpilog
+from .operators.indexer import MojoKvCompressEpilog
+from .operators.indexer import MojoSparseAttnSharedkv
+from .operators.indexer import MojoSparseAttnSharedkvMetadata
+from .operators.indexer import MojoKvQuantSparseAttnSharedkv
+from .operators.indexer import MojoKvQuantSparseAttnSharedkvMetadata
+from .operators.indexer import MojoQuantLightningIndexerMetadata
 
 """ hc_post """
 from .operators.hc_post import MojoHcPost
@@ -195,6 +212,15 @@ __all__ = [
     "MojoDynamicQuant",
     "MojoMoEDynamicQuant",
     "MojoDequantSwiGLUQuant",
+    "MojoQuantMatmul",
+    "MojoFunctionalDequantSwiGLUQuant",
+    "MojoGroupedMatmul",
+    "MojoFormatCast",
+    "MojoMoEInitRoutingV2",
+    "MojoMoEReRouting",
+    "MojoMoEFinalizeRouting",
+    "MojoMoEDistributeDispatchV2",
+    "MojoMoEDistributeCombineV2",
 
     "MojoEmbedding",
     "MojoParallelEmbedding",
@@ -255,6 +281,14 @@ __all__ = [
     "MojoCausalConv1dFunction",
 
     "MojoLightningIndexer",
+    "MojoQuantLightningIndexer",
+    "MojoIndexerCompressEpilog",
+    "MojoKvCompressEpilog",
+    "MojoSparseAttnSharedkv",
+    "MojoSparseAttnSharedkvMetadata",
+    "MojoKvQuantSparseAttnSharedkv",
+    "MojoKvQuantSparseAttnSharedkvMetadata",
+    "MojoQuantLightningIndexerMetadata",
 
     "MojoHcPost",
     "MojoHcPre",
