@@ -2,11 +2,20 @@ import math
 import json
 import os
 import logging
+import time
+from contextlib import nullcontext
 from typing import Optional, Tuple
 
 import torch
 import torch_npu
 import custom_ops
+import ctypes
+_custom_transformer_lib = os.path.join(
+    os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/cann-9.0.0-beta.2"),
+    "opp/vendors/custom_transformer/op_api/lib/libcust_opapi.so",
+)
+if os.path.exists(_custom_transformer_lib):
+    ctypes.CDLL(_custom_transformer_lib)
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -18,6 +27,68 @@ from mojo_opset import MojoDynamicQuant
 from mojo_opset import MojoMoEDispatch
 from mojo_opset import MojoQuantExperts
 from mojo_opset import MojoMoECombine
+
+
+_DSV4_LAYER_PROFILE = os.getenv("DSV4_LAYER_PROFILE", "0") == "1"
+_DSV4_LAYER_PROFILE_STATS = {}
+
+
+def _profile_rank0() -> bool:
+    return (not dist.is_initialized()) or dist.get_rank() == 0
+
+
+def _profile_sync():
+    if _DSV4_LAYER_PROFILE:
+        torch_npu.npu.synchronize()
+
+
+def _profile_record(layer_idx: int, name: str, elapsed_ms: float):
+    if not _DSV4_LAYER_PROFILE or not _profile_rank0():
+        return
+    layer_stats = _DSV4_LAYER_PROFILE_STATS.setdefault(int(layer_idx), {})
+    layer_stats.setdefault(name, []).append(float(elapsed_ms))
+
+
+class _ProfileTimer:
+    def __init__(self, layer_idx: int, name: str):
+        self.layer_idx = layer_idx
+        self.name = name
+        self.start = 0.0
+
+    def __enter__(self):
+        if _DSV4_LAYER_PROFILE:
+            _profile_sync()
+            self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if _DSV4_LAYER_PROFILE:
+            _profile_sync()
+            _profile_record(self.layer_idx, self.name, (time.perf_counter() - self.start) * 1000.0)
+        return False
+
+
+def _profile_timer(layer_idx: int, name: str) -> _ProfileTimer:
+    return _ProfileTimer(layer_idx, name)
+
+
+def reset_dsv4_layer_profile():
+    _DSV4_LAYER_PROFILE_STATS.clear()
+
+
+def get_dsv4_layer_profile():
+    return {
+        str(layer_idx): {
+            name: {
+                "count": len(values),
+                "total_ms": sum(values),
+                "avg_ms": sum(values) / len(values) if values else 0.0,
+                "values_ms": values,
+            }
+            for name, values in stats.items()
+        }
+        for layer_idx, stats in sorted(_DSV4_LAYER_PROFILE_STATS.items())
+    }
 
 
 def _get_had_pow2(n: int, norm: bool = True, device: Optional[torch.device] = None) -> torch.Tensor:
@@ -397,23 +468,28 @@ class PagedDummyCache:
         seq_used_q: torch.Tensor,
         pad_to_window: bool = False,
     ) -> torch.Tensor:
+        start_pos = start_pos.to(device=self.device, dtype=torch.int32)
+        seq_used_q = seq_used_q.to(device=self.device, dtype=torch.int32)
+        batch_size = start_pos.shape[0]
         block_table = self._calc_ring_block_table(self.win_cache_size, start_pos.shape[0])
-        slots = []
-        for b in range(start_pos.shape[0]):
-            if pad_to_window:
-                seq_len = self.sliding_window
-                base_pos = max(0, int(start_pos[b].item()) + int(seq_used_q[b].item()) - self.sliding_window)
-            else:
-                seq_len = int(seq_used_q[b].item())
-                base_pos = int(start_pos[b].item())
-            for t in range(seq_len):
-                pos = base_pos + t
-                block_idx = pos // self.block_size
-                offset = pos % self.block_size
-                slots.append(block_table[b, block_idx] * self.block_size + offset)
-        if not slots:
-            return torch.empty((0,), dtype=torch.int32, device=self.device)
-        return torch.stack(slots).to(dtype=torch.int32)
+        if pad_to_window:
+            seq_len = self.sliding_window
+            base_pos = torch.clamp(start_pos + seq_used_q - self.sliding_window, min=0)
+            valid_mask = torch.ones((batch_size, seq_len), dtype=torch.bool, device=self.device)
+        else:
+            seq_len = int(seq_used_q.max().item()) if batch_size > 0 else 0
+            if seq_len == 0:
+                return torch.empty((0,), dtype=torch.int32, device=self.device)
+            base_pos = start_pos
+            valid_mask = torch.arange(seq_len, dtype=torch.int32, device=self.device).unsqueeze(0) < seq_used_q.unsqueeze(1)
+
+        offsets_in_seq = torch.arange(seq_len, dtype=torch.int32, device=self.device).unsqueeze(0)
+        positions = base_pos.unsqueeze(1) + offsets_in_seq
+        block_idx = (positions // self.block_size).to(torch.long)
+        block_offset = positions % self.block_size
+        row_idx = torch.arange(batch_size, device=self.device, dtype=torch.long).unsqueeze(1).expand_as(block_idx)
+        slots = block_table[row_idx, block_idx] * self.block_size + block_offset
+        return slots[valid_mask].to(dtype=torch.int32)
 
     def get_full_kv_gather_indices(
         self,
@@ -430,28 +506,31 @@ class PagedDummyCache:
         kv: torch.Tensor,
         context_lens: torch.Tensor,
         cu_q_lens: torch.Tensor,
+        actual_q_lens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = kv.shape[0]
+        seq_len = kv.shape[1]
         full_kv = self._create_cache(self._get_block_num(self.max_seq_len), self.head_dim, kv.dtype)
         block_table = self._calc_full_block_table(self.max_seq_len, batch_size)
-        kv_flat = kv.reshape(-1, self.head_dim)
-        slot_mapping = torch.full((kv_flat.shape[0],), -1, dtype=torch.int32, device=kv.device)
-        for b in range(batch_size):
-            context_len = int(context_lens[b].item())
-            q_start = int(cu_q_lens[b].item())
-            q_end = int(cu_q_lens[b + 1].item())
-            for t in range(q_end - q_start):
-                pos = context_len + t
-                block_idx = pos // self.block_size
-                offset = pos % self.block_size
-                if block_idx < block_table.shape[1]:
-                    slot_mapping[q_start + t] = block_table[b, block_idx] * self.block_size + offset
-        valid_mask = slot_mapping >= 0
-        if valid_mask.any():
+        q_lens = (cu_q_lens[1:] - cu_q_lens[:-1]).to(device=kv.device, dtype=torch.int32)
+        if actual_q_lens is not None:
+            q_lens = actual_q_lens.to(device=kv.device, dtype=torch.int32)
+        token_offsets = torch.arange(seq_len, dtype=torch.int32, device=kv.device).unsqueeze(0)
+        valid_mask = token_offsets < q_lens.unsqueeze(1)
+        positions = context_lens.to(device=kv.device, dtype=torch.int32).unsqueeze(1) + token_offsets
+        block_idx = (positions // self.block_size).to(torch.long)
+        valid_mask = valid_mask & (block_idx < block_table.shape[1])
+
+        if bool(valid_mask.any().item()):
+            row_idx = torch.arange(batch_size, device=kv.device, dtype=torch.long).unsqueeze(1).expand_as(block_idx)
+            offset = positions % self.block_size
+            slot_mapping = (block_table[row_idx, block_idx.clamp(max=block_table.shape[1] - 1)] * self.block_size + offset)
+            kv_flat = kv[valid_mask].reshape(-1, self.head_dim)
+            slot_mapping = slot_mapping[valid_mask].to(dtype=torch.int32)
             torch.ops.custom.scatter_nd_update_asc(
                 full_kv.view(-1, self.head_dim),
-                slot_mapping[valid_mask].reshape(-1, 1),
-                kv_flat[valid_mask],
+                slot_mapping.reshape(-1, 1),
+                kv_flat,
             )
         return full_kv, block_table
 
@@ -469,7 +548,8 @@ class PagedDummyCache:
         self.num_free_blocks -= num_blocks
         return allocated
 
-    def update(self, kv: torch.Tensor, layer_idx: int, cu_q_lens: Optional[torch.Tensor] = None) -> None:
+    def update(self, kv: torch.Tensor, layer_idx: int, cu_q_lens: Optional[torch.Tensor] = None,
+               actual_q_lens: Optional[torch.Tensor] = None) -> None:
         batch_size = kv.shape[0]
         new_seq_len = kv.shape[1]
 
@@ -480,39 +560,43 @@ class PagedDummyCache:
             )
 
         current_seq_lens = self.seq_lens[layer_idx]
-        for i in range(batch_size):
-            context_len = current_seq_lens[i].item()
-            old_num_blocks = (context_len + self.block_size - 1) // self.block_size
-            new_total_len = context_len + new_seq_len
-            new_num_blocks = (new_total_len + self.block_size - 1) // self.block_size
-            if new_num_blocks > old_num_blocks:
-                num_to_allocate = new_num_blocks - old_num_blocks
-                newly_allocated = self._allocate_blocks(num_to_allocate)
-                self.block_tables[layer_idx, i, old_num_blocks:new_num_blocks] = newly_allocated
+        q_lens = (cu_q_lens[1:] - cu_q_lens[:-1]).to(device=kv.device, dtype=torch.int32)
+        if actual_q_lens is not None:
+            q_lens = actual_q_lens.to(device=kv.device, dtype=torch.int32)
+        new_total_lens = current_seq_lens + q_lens
 
-        kv_flat = kv.reshape(-1, self.head_dim)
-        slot_mapping = torch.full((kv_flat.shape[0],), -1, dtype=torch.int32, device=kv.device)
-        for b in range(batch_size):
-            context_len = current_seq_lens[b].item()
-            q_start = cu_q_lens[b].item()
-            q_end = cu_q_lens[b + 1].item()
-            q_len = q_end - q_start
-            for t in range(q_len):
-                pos = context_len + t
-                block_idx = pos // self.block_size
-                offset = pos % self.block_size
-                if block_idx < self.block_tables.shape[2]:
-                    phys_block = self.block_tables[layer_idx, b, block_idx].item()
-                    if phys_block >= 0:
-                        slot_mapping[q_start + t] = phys_block * self.block_size + offset
+        max_blocks_per_seq = self.block_tables.shape[2]
+        logical_blocks = torch.arange(max_blocks_per_seq, dtype=torch.int32, device=kv.device).unsqueeze(0)
+        required_blocks = (new_total_lens + self.block_size - 1) // self.block_size
+        required_mask = logical_blocks < required_blocks.unsqueeze(1)
 
-        valid_mask = slot_mapping >= 0
-        if valid_mask.any():
-            cache_flat = self.kv_cache.view(-1, self.head_dim)
-            torch.ops.custom.scatter_nd_update_asc(
-                cache_flat, slot_mapping[valid_mask].reshape(-1, 1), kv_flat[valid_mask]
-            )
-        self.seq_lens[layer_idx] += new_seq_len
+        # Use a deterministic physical block layout, equivalent to golden's static PA table.
+        layer_base = layer_idx * batch_size * max_blocks_per_seq
+        batch_base = torch.arange(batch_size, dtype=torch.int32, device=kv.device).unsqueeze(1) * max_blocks_per_seq
+        deterministic_blocks = layer_base + batch_base + logical_blocks
+        self.block_tables[layer_idx] = torch.where(
+            required_mask,
+            deterministic_blocks,
+            self.block_tables[layer_idx],
+        )
+
+        token_offsets = torch.arange(new_seq_len, dtype=torch.int32, device=kv.device).unsqueeze(0)
+        valid_mask = token_offsets < q_lens.unsqueeze(1)
+        positions = current_seq_lens.unsqueeze(1) + token_offsets
+        block_idx = (positions // self.block_size).to(torch.long)
+        valid_mask = valid_mask & (block_idx < max_blocks_per_seq)
+
+        row_idx = torch.arange(batch_size, device=kv.device, dtype=torch.long).unsqueeze(1).expand_as(block_idx)
+        block_idx_safe = block_idx.clamp(max=max_blocks_per_seq - 1)
+        phys_block = self.block_tables[layer_idx][row_idx, block_idx_safe]
+        slot_mapping = (phys_block * self.block_size + (positions % self.block_size)).to(dtype=torch.int32)
+        kv_flat = kv[valid_mask].reshape(-1, self.head_dim)
+        slot_mapping = slot_mapping[valid_mask]
+        cache_flat = self.kv_cache.view(-1, self.head_dim)
+        torch.ops.custom.scatter_nd_update_asc(
+            cache_flat, slot_mapping.reshape(-1, 1), kv_flat
+        )
+        self.seq_lens[layer_idx] = new_total_lens.to(self.seq_lens.dtype)
 
     def update_win_kv(
         self,
@@ -531,16 +615,14 @@ class PagedDummyCache:
         if gather_indices is not None:
             if start_pos is None:
                 start_pos = torch.zeros(batch_size, dtype=torch.int32, device=kv.device)
-            gathered_kv = []
-            for b in range(batch_size):
-                local_idx = gather_indices[b].to(kv.device) - start_pos[b].to(torch.int32)
-                local_idx = torch.where(
-                    (local_idx >= 0) & (local_idx < seq_len),
-                    local_idx,
-                    torch.zeros_like(local_idx),
-                )
-                gathered_kv.append(kv[b].index_select(0, local_idx.to(torch.long)))
-            kv_flat = torch.stack(gathered_kv, dim=0).reshape(-1, self.head_dim)
+            local_idx = gather_indices.to(kv.device, dtype=torch.int32) - start_pos.to(kv.device, dtype=torch.int32).unsqueeze(1)
+            local_idx = torch.where(
+                (local_idx >= 0) & (local_idx < seq_len),
+                local_idx,
+                torch.zeros_like(local_idx),
+            ).to(torch.long)
+            row_idx = torch.arange(batch_size, device=kv.device, dtype=torch.long).unsqueeze(1).expand_as(local_idx)
+            kv_flat = kv[row_idx, local_idx].reshape(-1, self.head_dim)
         else:
             kv_flat = kv.reshape(-1, self.head_dim)
         win_flat = win_cache.view(-1, self.head_dim)
@@ -654,6 +736,38 @@ def _yarn_get_mscale(scale=1.0, mscale=1.0):
     if scale <= 1.0:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def _cu_seqlens_from_q_lens(q_lens: torch.Tensor) -> torch.Tensor:
+    return torch.cat([
+        torch.zeros(1, dtype=torch.int32, device=q_lens.device),
+        q_lens.to(torch.int32).cumsum(0, dtype=torch.int32),
+    ])
+
+
+def _compact_by_q_lens(tensor: torch.Tensor, q_lens: torch.Tensor) -> torch.Tensor:
+    chunks = []
+    for b in range(tensor.shape[0]):
+        chunks.append(tensor[b, : int(q_lens[b].item())])
+    if not chunks:
+        return tensor.new_empty((0, *tensor.shape[2:]))
+    return torch.cat(chunks, dim=0)
+
+
+def _scatter_compact_to_padded(
+    compact: torch.Tensor,
+    q_lens: torch.Tensor,
+    batch_size: int,
+    seq_length: int,
+) -> torch.Tensor:
+    output = compact.new_zeros((batch_size, seq_length, *compact.shape[1:]))
+    offset = 0
+    for b in range(batch_size):
+        q_len = int(q_lens[b].item())
+        if q_len > 0:
+            output[b, :q_len] = compact[offset: offset + q_len]
+        offset += q_len
+    return output
 
 
 class DeepseekV4RotaryEmbedding(nn.Module):
@@ -816,23 +930,27 @@ class DeepseekV4Indexer(nn.Module):
 
     def forward(self, x, qr, cos, sin, past_key_values=None, layer_idx=0,
                 cu_seqlens_q=None, seq_lens=None, start_pos: Optional[torch.Tensor] = None,
-                state_block_table: Optional[torch.Tensor] = None):
+                state_block_table: Optional[torch.Tensor] = None,
+                seq_used_q: Optional[torch.Tensor] = None):
         batch_size, seq_len, _ = x.shape
 
-        weights = self.weights_proj(x.to(torch.bfloat16).reshape(-1, self.hidden_size))
-        weights = weights.view(batch_size, seq_len, self.n_heads) * (self.softmax_scale * self.n_heads ** -0.5)
+        with _profile_timer(layer_idx, "indexer_weights_proj"):
+            weights = self.weights_proj(x.to(torch.bfloat16).reshape(-1, self.hidden_size))
+            weights = weights.view(-1, self.n_heads) * (self.softmax_scale * self.n_heads ** -0.5)
 
         li_state_cache = None
         if past_key_values is not None:
             li_state_cache = past_key_values.get_li_kv_state(layer_idx)
+        logical_batch_size = int(seq_used_q.shape[0]) if seq_used_q is not None else batch_size
         if start_pos is None:
-            start_pos = torch.zeros(batch_size, dtype=torch.int32, device=x.device)
+            start_pos = torch.zeros(logical_batch_size, dtype=torch.int32, device=x.device)
         if cu_seqlens_q is None:
             cu_seqlens_q = torch.arange(
                 0, (batch_size + 1) * seq_len, step=seq_len,
                 dtype=torch.int32, device=x.device,
             )
-        seq_used_q = torch.full((batch_size,), seq_len, dtype=torch.int32, device=x.device)
+        if seq_used_q is None:
+            seq_used_q = torch.full((logical_batch_size,), seq_len, dtype=torch.int32, device=x.device)
         if state_block_table is None and past_key_values is not None:
             state_block_table = past_key_values.get_cmp_state_block_table(layer_idx, start_pos, seq_used_q, True)
 
@@ -847,32 +965,35 @@ class DeepseekV4Indexer(nn.Module):
             cmp_cos = cos[:, ::self.compress_ratio, :]
             cmp_sin = sin[:, ::self.compress_ratio, :]
         self.compressor.debug_layer_idx = layer_idx
-        li_kv = self.compressor(
-            x, cmp_cos, cmp_sin,
-            state_cache=li_state_cache,
-            state_block_table=state_block_table,
-            cu_seqlens=cu_seqlens_q,
-            seq_used_q=seq_used_q,
-            start_pos=start_pos,
-        )
+        with _profile_timer(layer_idx, "indexer_compressor"):
+            li_kv = self.compressor(
+                x, cmp_cos, cmp_sin,
+                state_cache=li_state_cache,
+                state_block_table=state_block_table,
+                cu_seqlens=cu_seqlens_q,
+                seq_used_q=seq_used_q,
+                start_pos=start_pos,
+            )
 
         if past_key_values is not None:
-            cmp_slot_mapping = past_key_values.get_cmp_slot_mapping(
-                layer_idx,
-                start_pos,
-                seq_used_q,
-                cu_seqlens_q=cu_seqlens_q,
-                compressed_len=compressed_len,
-                position_ids_cmp=(position_ids_cmp.squeeze(0) // self.compress_ratio).to(torch.int32),
-            )
-            past_key_values.update_li_cmp_kv(li_kv, layer_idx, cmp_slot_mapping)
+            with _profile_timer(layer_idx, "indexer_li_cache_update"):
+                cmp_slot_mapping = past_key_values.get_cmp_slot_mapping(
+                    layer_idx,
+                    start_pos,
+                    seq_used_q,
+                    cu_seqlens_q=cu_seqlens_q,
+                    compressed_len=compressed_len,
+                    position_ids_cmp=(position_ids_cmp.squeeze(0) // self.compress_ratio).to(torch.int32),
+                )
+                past_key_values.update_li_cmp_kv(li_kv, layer_idx, cmp_slot_mapping)
 
-        qr_flat = qr.reshape(-1, self.q_lora_rank).to(torch.bfloat16)
-        qr_quant, qr_scale = _dynamic_quant_per_token(qr_flat)
-        q = self.wq_b(qr_quant, qr_scale)
-        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)
-        q = _apply_partial_rotary(q, cos, sin, self.partial_slice)
-        q = _rotate_activation(q, self.hadamard_matrix)
+        with _profile_timer(layer_idx, "indexer_q_proj_rope"):
+            qr_flat = qr.reshape(-1, self.q_lora_rank).to(torch.bfloat16)
+            qr_quant, qr_scale = _dynamic_quant_per_token(qr_flat)
+            q = self.wq_b(qr_quant, qr_scale)
+            q = q.view(1, -1, self.n_heads, self.head_dim)
+            q = _apply_partial_rotary(q, cos, sin, self.partial_slice)
+            q = _rotate_activation(q, self.hadamard_matrix)
 
         if past_key_values is not None:
             li_cmp_kv = past_key_values.get_li_cmp_kv(layer_idx)
@@ -880,40 +1001,46 @@ class DeepseekV4Indexer(nn.Module):
             c4a_block_table = past_key_values.get_c4a_cmp_kv_block_table(layer_idx)
 
             q_flat = q.flatten(0, 1)
-            q_quant, q_scale = torch_npu.npu_dynamic_quant(q_flat)
-            q_scale = q_scale.to(torch.float16)
+            with _profile_timer(layer_idx, "indexer_q_quant"):
+                q_quant, q_scale = torch_npu.npu_dynamic_quant(q_flat)
+                q_scale = q_scale.to(torch.float16)
 
             actual_seq_q = cu_seqlens_q[1:] if cu_seqlens_q is not None else torch.tensor([seq_len], dtype=torch.int32, device=x.device)
             actual_seq_k = seq_lens if seq_lens is not None else torch.tensor([seq_len], dtype=torch.int32, device=x.device)
 
-            li_metadata = torch.ops.custom.npu_quant_lightning_indexer_metadata(
-                layout_key='PA_BSND',
-                sparse_count=self.index_topk,
-                sparse_mode=3,
-                layout_query="TND",
-                cmp_ratio=self.compress_ratio,
-                key_quant_mode=0,
-                query_quant_mode=0,
-                num_heads_q=self.n_heads,
-                num_heads_k=1,
-                head_dim=self.head_dim,
-                actual_seq_lengths_query=actual_seq_q,
-                actual_seq_lengths_key=actual_seq_k,
-            )
+            with _profile_timer(layer_idx, "indexer_metadata"):
+                li_metadata = torch.ops.custom.npu_quant_lightning_indexer_metadata(
+                    layout_key='PA_BSND',
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                    layout_query="TND",
+                    cmp_ratio=self.compress_ratio,
+                    key_quant_mode=0,
+                    query_quant_mode=0,
+                    num_heads_q=self.n_heads,
+                    num_heads_k=1,
+                    head_dim=self.head_dim,
+                    actual_seq_lengths_query=actual_seq_q,
+                    actual_seq_lengths_key=actual_seq_k,
+                )
 
-            topk_idxs, _ = torch.ops.custom.npu_quant_lightning_indexer(
-                query=q_quant, key=li_cmp_kv, weights=weights.flatten(0, 1).to(torch.float16),
-                query_dequant_scale=q_scale,
-                key_dequant_scale=li_key_dequant_scale.squeeze(-2),
-                actual_seq_lengths_query=actual_seq_q,
-                actual_seq_lengths_key=actual_seq_k,
-                block_table=c4a_block_table, layout_key='PA_BSND',
-                sparse_count=self.index_topk, sparse_mode=3,
-                layout_query="TND", cmp_ratio=self.compress_ratio,
-                key_quant_mode=0, query_quant_mode=0,
-                metadata=li_metadata,
-            )
-            return topk_idxs.view(q_flat.shape[0], -1, self.index_topk)
+            with _profile_timer(layer_idx, "indexer_li_kernel"):
+                topk_idxs, _ = torch.ops.custom.npu_quant_lightning_indexer(
+                    query=q_quant,
+                    key=li_cmp_kv,
+                    weights=weights.to(torch.float16),
+                    query_dequant_scale=q_scale,
+                    key_dequant_scale=li_key_dequant_scale.squeeze(-2),
+                    actual_seq_lengths_query=actual_seq_q,
+                    actual_seq_lengths_key=actual_seq_k,
+                    block_table=c4a_block_table, layout_key='PA_BSND',
+                    sparse_count=self.index_topk, sparse_mode=3,
+                    layout_query="TND", cmp_ratio=self.compress_ratio,
+                    key_quant_mode=0, query_quant_mode=0,
+                    metadata=li_metadata,
+                )
+            topk_idxs = topk_idxs.view(q_flat.shape[0], -1, self.index_topk)
+            return topk_idxs
 
         return None
 
@@ -1145,6 +1272,15 @@ class DeepseekV4Attention(nn.Module):
         **kwargs,
     ) -> Tuple[torch.Tensor, None]:
         batch_size, seq_length = hidden_states.shape[:2]
+        q_lens = kwargs.get("q_lens")
+        if q_lens is None:
+            q_lens = torch.full((batch_size,), seq_length, dtype=torch.int32, device=hidden_states.device)
+        else:
+            q_lens = q_lens.to(dtype=torch.int32, device=hidden_states.device)
+        cu_seqlens_q = torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=hidden_states.device),
+            torch.arange(1, batch_size + 1, dtype=torch.int32, device=hidden_states.device) * seq_length,
+        ])
 
         context_lens = (
             past_key_values.get_seq_length(self.layer_idx)
@@ -1152,26 +1288,27 @@ class DeepseekV4Attention(nn.Module):
             else torch.zeros(batch_size, dtype=torch.long, device=hidden_states.device)
         )
 
-        h_flat = hidden_states.reshape(-1, hidden_states.shape[-1]).to(torch.bfloat16)
+        with _profile_timer(self.layer_idx, "attention_setup"):
+            h_flat = hidden_states.reshape(-1, hidden_states.shape[-1]).to(torch.bfloat16)
 
-        qa = self.wq_a(h_flat)
-        qa = qa.view(batch_size, seq_length, -1)
-        qa = self.q_norm(qa)
-        qa_flat = qa.reshape(-1, qa.shape[-1]).to(torch.bfloat16)
-        qa_quant, qa_scale = self.q_a_quant(qa_flat)
-        q = self.wq_b(qa_quant, qa_scale)
-        q = q.view(batch_size, seq_length, self.num_heads, self.head_dim)
-        q = self.q_b_norm(q)
+            qa = self.wq_a(h_flat)
+            qa = qa.view(batch_size, seq_length, -1)
+            qa = self.q_norm(qa)
+            qa_flat = qa.reshape(-1, qa.shape[-1]).to(torch.bfloat16)
+            qa_quant, qa_scale = self.q_a_quant(qa_flat)
+            q = self.wq_b(qa_quant, qa_scale)
+            q = q.view(batch_size, seq_length, self.num_heads, self.head_dim)
+            q = self.q_b_norm(q)
 
-        kv = self.wkv(h_flat)
-        kv = self.kv_norm(kv)
-        kv = kv.view(batch_size, seq_length, self.head_dim)
+            kv = self.wkv(h_flat)
+            kv = self.kv_norm(kv)
+            kv = kv.view(batch_size, seq_length, self.head_dim)
 
-        cos, sin = position_embeddings
-        q = _apply_partial_rotary(q, cos, sin, self.partial_slice)
-        kv = _apply_partial_rotary(
-            kv.view(batch_size, seq_length, 1, self.head_dim), cos, sin, self.partial_slice
-        ).view(batch_size, seq_length, self.head_dim)
+            cos, sin = position_embeddings
+            q = _apply_partial_rotary(q, cos, sin, self.partial_slice)
+            kv = _apply_partial_rotary(
+                kv.view(batch_size, seq_length, 1, self.head_dim), cos, sin, self.partial_slice
+            ).view(batch_size, seq_length, self.head_dim)
 
         if past_key_values is None:
             raise ValueError("Paged Attention requires a PagedDummyCache instance.")
@@ -1180,11 +1317,7 @@ class DeepseekV4Attention(nn.Module):
         if self.sfa_compressor is not None:
             sfa_state_cache = past_key_values.get_sfa_kv_state(self.layer_idx)
             start_pos = context_lens.to(dtype=torch.int32)
-            seq_used_q = torch.full((batch_size,), seq_length, dtype=torch.int32, device=hidden_states.device)
-            cu_seqlens_q = torch.arange(
-                0, (batch_size + 1) * seq_length, step=seq_length,
-                dtype=torch.int32, device=hidden_states.device,
-            )
+            seq_used_q = q_lens
             compressed_len, cmp_rope_position_ids = past_key_values.get_compressed_rope_position_ids(
                 start_pos, seq_used_q, cu_seqlens_q, self.compress_ratio
             )
@@ -1215,38 +1348,53 @@ class DeepseekV4Attention(nn.Module):
                 is_prefill=is_prefill,
             )
             self.sfa_compressor.debug_layer_idx = self.layer_idx
-            cmp_kv = self.sfa_compressor(
-                hidden_states, cmp_cos, cmp_sin,
-                state_cache=sfa_state_cache,
-                state_block_table=state_block_table,
-                cu_seqlens=cu_seqlens_q,
-                seq_used_q=seq_used_q,
-                start_pos=start_pos,
-            )
-            past_key_values.update_sfa_cmp_kv(cmp_kv, self.layer_idx, cmp_slot_mapping)
+            compressor_hidden_states = hidden_states
+            with _profile_timer(self.layer_idx, "compressor"):
+                cmp_kv = self.sfa_compressor(
+                    compressor_hidden_states, cmp_cos, cmp_sin,
+                    state_cache=sfa_state_cache,
+                    state_block_table=state_block_table,
+                    cu_seqlens=cu_seqlens_q,
+                    seq_used_q=seq_used_q,
+                    start_pos=start_pos,
+                )
+            with _profile_timer(self.layer_idx, "cache_update"):
+                past_key_values.update_sfa_cmp_kv(cmp_kv, self.layer_idx, cmp_slot_mapping)
 
             if self.indexer is not None:
-                current_seq_lens = context_lens.to(dtype=torch.int32) + seq_length
-                cmp_sparse_indices = self.indexer.forward(
-                    hidden_states, qa, cos, sin,
-                    past_key_values=past_key_values, layer_idx=self.layer_idx,
-                    cu_seqlens_q=cu_seqlens_q,
-                    seq_lens=current_seq_lens,
-                    start_pos=start_pos,
-                    state_block_table=state_block_table,
-                )
+                if is_prefill:
+                    current_seq_lens = torch.full(
+                        (batch_size,), seq_length, dtype=torch.int32, device=hidden_states.device
+                    )
+                else:
+                    current_seq_lens = context_lens.to(dtype=torch.int32) + q_lens
+                indexer_hidden_states = hidden_states
+                indexer_qa = qa
+                indexer_cos = cos
+                indexer_sin = sin
+                with _profile_timer(self.layer_idx, "indexer"):
+                    cmp_sparse_indices = self.indexer.forward(
+                        indexer_hidden_states, indexer_qa, indexer_cos, indexer_sin,
+                        past_key_values=past_key_values, layer_idx=self.layer_idx,
+                        cu_seqlens_q=cu_seqlens_q,
+                        seq_lens=current_seq_lens,
+                        start_pos=start_pos,
+                        state_block_table=state_block_table,
+                        seq_used_q=q_lens,
+                    )
 
         if self._is_c1a:
-            o = self._c1a_attention(q, kv, past_key_values, context_lens, is_prefill)
+            o = self._c1a_attention(q, kv, past_key_values, context_lens, is_prefill, q_lens)
         else:
-            o = self._sparse_attention(q, kv, past_key_values, context_lens, cmp_sparse_indices, is_prefill)
+            o = self._sparse_attention(q, kv, past_key_values, context_lens, cmp_sparse_indices, is_prefill, q_lens)
 
-        o = self._attn_post(o, position_embeddings)
+        with _profile_timer(self.layer_idx, "attention_post"):
+            o = self._attn_post(o, position_embeddings)
         return o, None
 
     def _run_attn(self, q, kv_cache, block_tables, seq_lens, batch_size, seq_length,
                   compress_ratio, cu_q_lens=None, cmp_kv_cache=None, cmp_block_tables=None,
-                  cmp_sparse_indices=None):
+                  cmp_sparse_indices=None, q_lens=None):
         has_cmp_kv = compress_ratio > 1
         metadata_kwargs = {
             "cu_seqlens_q": cu_q_lens,
@@ -1268,60 +1416,78 @@ class DeepseekV4Attention(nn.Module):
         if has_cmp_kv and compress_ratio == 4:
             metadata_kwargs["cmp_topk"] = self.config.index_topk
 
-        metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**metadata_kwargs)
+        with _profile_timer(self.layer_idx, "attention_metadata"):
+            metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**metadata_kwargs)
 
         self._debug_sparse_attn_inputs(
             q, kv_cache, block_tables, seq_lens, batch_size, seq_length,
             compress_ratio, cu_q_lens, cmp_kv_cache, cmp_block_tables, cmp_sparse_indices,
         )
 
-        o = torch.ops.custom.npu_sparse_attn_sharedkv(
-            q=q, ori_kv=kv_cache,
-            cmp_kv=cmp_kv_cache if has_cmp_kv else None,
-            cmp_sparse_indices=cmp_sparse_indices if has_cmp_kv else None,
-            cu_seqlens_q=cu_q_lens, seqused_kv=seq_lens,
-            cmp_block_table=cmp_block_tables if has_cmp_kv and cmp_block_tables is not None else None,
-            ori_block_table=block_tables, cmp_ratio=compress_ratio,
-            ori_mask_mode=4, cmp_mask_mode=3,
-            ori_win_left=self.sliding_window - 1, ori_win_right=0,
-            layout_q="TND", layout_kv="PA_ND",
-            sinks=self.attn_sink, metadata=metadata,
-            softmax_scale=self.scaling,
-        )[0]
+        with _profile_timer(self.layer_idx, "attn_core"):
+            o = torch.ops.custom.npu_sparse_attn_sharedkv(
+                q=q, ori_kv=kv_cache,
+                cmp_kv=cmp_kv_cache if has_cmp_kv else None,
+                cmp_sparse_indices=cmp_sparse_indices if has_cmp_kv else None,
+                cu_seqlens_q=cu_q_lens, seqused_kv=seq_lens,
+                cmp_block_table=cmp_block_tables if has_cmp_kv and cmp_block_tables is not None else None,
+                ori_block_table=block_tables, cmp_ratio=compress_ratio,
+                ori_mask_mode=4, cmp_mask_mode=3,
+                ori_win_left=self.sliding_window - 1, ori_win_right=0,
+                layout_q="TND", layout_kv="PA_ND",
+                sinks=self.attn_sink, metadata=metadata,
+                softmax_scale=self.scaling,
+            )[0]
         return o.view(batch_size, seq_length, self.num_heads, self.head_dim)
 
-    def _c1a_attention(self, q, kv, past_key_values, context_lens, is_prefill: bool):
+    def _c1a_attention(self, q, kv, past_key_values, context_lens, is_prefill: bool, q_lens: torch.Tensor):
         batch_size, seq_length = q.shape[:2]
-        q_tnd = q.contiguous().view(-1, self.num_heads, self.head_dim)
-        current_seq_lens = context_lens + seq_length
-        q_lens = torch.full((batch_size,), seq_length, dtype=torch.int32, device=q.device)
-        cu_q_lens = torch.cat([torch.tensor([0], device=q.device, dtype=torch.int32), q_lens.cumsum(0, dtype=torch.int32)])
+        q_padded = q.contiguous().view(-1, self.num_heads, self.head_dim)
+        cu_q_lens_padded = torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=q.device),
+            torch.arange(1, batch_size + 1, dtype=torch.int32, device=q.device) * seq_length,
+        ])
         if is_prefill:
-            kv_cache, block_tables = past_key_values.build_full_kv_for_prefill(kv, context_lens, cu_q_lens)
-            win_slot_mapping = past_key_values.get_win_slot_mapping(context_lens, q_lens, pad_to_window=True)
-            full_kv_gather_indices = past_key_values.get_full_kv_gather_indices(context_lens, q_lens)
-            past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping, full_kv_gather_indices, context_lens)
+            current_seq_lens = torch.full((batch_size,), seq_length, dtype=torch.int32, device=q.device)
+        else:
+            current_seq_lens = context_lens + q_lens
+        if is_prefill:
+            with _profile_timer(self.layer_idx, "cache_update"):
+                kv_cache, block_tables = past_key_values.build_full_kv_for_prefill(kv, context_lens, cu_q_lens_padded, actual_q_lens=q_lens)
+                win_slot_mapping = past_key_values.get_win_slot_mapping(context_lens, q_lens, pad_to_window=True)
+                full_kv_gather_indices = past_key_values.get_full_kv_gather_indices(context_lens, q_lens)
+                past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping, full_kv_gather_indices, context_lens)
         else:
             win_slot_mapping = past_key_values.get_win_slot_mapping(context_lens, q_lens)
             past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping)
             past_key_values.update(kv, self.layer_idx)
             kv_cache, block_tables = past_key_values.get_win_kv_for_decode(self.layer_idx)
-        out = self._run_attn(q_tnd, kv_cache, block_tables, current_seq_lens, batch_size, seq_length, 1, cu_q_lens)
+        out = self._run_attn(q_padded, kv_cache, block_tables, current_seq_lens, batch_size, seq_length, 1, cu_q_lens_padded)
         if is_prefill:
-            past_key_values.update(kv, self.layer_idx, cu_q_lens)
+            with _profile_timer(self.layer_idx, "cache_update"):
+                past_key_values.update(kv, self.layer_idx, cu_q_lens_padded, actual_q_lens=q_lens)
+                past_key_values.seq_lens[self.layer_idx] = (context_lens + q_lens).to(past_key_values.seq_lens.dtype)
         return out
 
-    def _sparse_attention(self, q, kv, past_key_values, context_lens, cmp_sparse_indices=None, is_prefill: bool = True):
+    def _sparse_attention(self, q, kv, past_key_values, context_lens, cmp_sparse_indices=None, is_prefill: bool = True, q_lens: Optional[torch.Tensor] = None):
         batch_size, seq_length = q.shape[:2]
-        q_tnd = q.contiguous().view(-1, self.num_heads, self.head_dim)
-        current_seq_lens = context_lens + seq_length
-        q_lens = torch.full((batch_size,), seq_length, dtype=torch.int32, device=q.device)
-        cu_q_lens = torch.cat([torch.tensor([0], device=q.device, dtype=torch.int32), q_lens.cumsum(0, dtype=torch.int32)])
+        if q_lens is None:
+            q_lens = torch.full((batch_size,), seq_length, dtype=torch.int32, device=q.device)
+        q_padded = q.contiguous().view(-1, self.num_heads, self.head_dim)
+        cu_q_lens_padded = torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=q.device),
+            torch.arange(1, batch_size + 1, dtype=torch.int32, device=q.device) * seq_length,
+        ])
         if is_prefill:
-            kv_cache, block_tables = past_key_values.build_full_kv_for_prefill(kv, context_lens, cu_q_lens)
-            win_slot_mapping = past_key_values.get_win_slot_mapping(context_lens, q_lens, pad_to_window=True)
-            full_kv_gather_indices = past_key_values.get_full_kv_gather_indices(context_lens, q_lens)
-            past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping, full_kv_gather_indices, context_lens)
+            current_seq_lens = torch.full((batch_size,), seq_length, dtype=torch.int32, device=q.device)
+        else:
+            current_seq_lens = context_lens + q_lens
+        if is_prefill:
+            with _profile_timer(self.layer_idx, "cache_update"):
+                kv_cache, block_tables = past_key_values.build_full_kv_for_prefill(kv, context_lens, cu_q_lens_padded, actual_q_lens=q_lens)
+                win_slot_mapping = past_key_values.get_win_slot_mapping(context_lens, q_lens, pad_to_window=True)
+                full_kv_gather_indices = past_key_values.get_full_kv_gather_indices(context_lens, q_lens)
+                past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping, full_kv_gather_indices, context_lens)
         else:
             win_slot_mapping = past_key_values.get_win_slot_mapping(context_lens, q_lens)
             past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping)
@@ -1329,10 +1495,12 @@ class DeepseekV4Attention(nn.Module):
             kv_cache, block_tables = past_key_values.get_win_kv_for_decode(self.layer_idx)
         cmp_kv_cache = past_key_values.get_sfa_cmp_kv(self.layer_idx)
         cmp_block_tables = past_key_values.get_cmp_kv_block_table(self.layer_idx) if self.compress_ratio > 1 else None
-        out = self._run_attn(q_tnd, kv_cache, block_tables, current_seq_lens, batch_size, seq_length,
-                             self.compress_ratio, cu_q_lens, cmp_kv_cache, cmp_block_tables, cmp_sparse_indices)
+        out = self._run_attn(q_padded, kv_cache, block_tables, current_seq_lens, batch_size, seq_length,
+                             self.compress_ratio, cu_q_lens_padded, cmp_kv_cache, cmp_block_tables, cmp_sparse_indices)
         if is_prefill:
-            past_key_values.update(kv, self.layer_idx, cu_q_lens)
+            with _profile_timer(self.layer_idx, "cache_update"):
+                past_key_values.update(kv, self.layer_idx, cu_q_lens_padded, actual_q_lens=q_lens)
+                past_key_values.seq_lens[self.layer_idx] = (context_lens + q_lens).to(past_key_values.seq_lens.dtype)
         return out
 
     def _attn_post(self, o, position_embeddings):
@@ -1340,14 +1508,22 @@ class DeepseekV4Attention(nn.Module):
         cos = position_embeddings[0]
         sin = -position_embeddings[1]
 
-        o = _apply_partial_rotary(o, cos, sin, self.partial_slice)
-
+        torch.ops.custom.inplace_partial_rotary_mul(
+            o.flatten(0, 1).unsqueeze(2),
+            cos.reshape(-1, 1, 1, self.qk_rope_head_dim),
+            sin.reshape(-1, 1, 1, self.qk_rope_head_dim),
+            rotary_mode="interleave",
+            partial_slice=self.partial_slice,
+        )
         o = o.reshape(batch_size * seq_length, self.o_groups, -1).to(torch.bfloat16)
-        wo_a_weight = self.wo_a.weight.view(self.o_groups, self.o_lora_rank, -1)
-        o_t = o.transpose(0, 1).float()
-        wo_a_weight_t = wo_a_weight.transpose(1, 2).float()
-        wo_a_out = torch.bmm(o_t, wo_a_weight_t)
-        wo_a_out = wo_a_out.transpose(0, 1).reshape(batch_size * seq_length, -1).to(torch.bfloat16)
+        wo_a_weight = self.wo_a.weight.view(self.o_groups, self.o_lora_rank, -1).transpose(1, 2).contiguous()
+        wo_a_out = torch_npu.npu_transpose_batchmatmul(
+            o,
+            wo_a_weight,
+            perm_x1=(1, 0, 2),
+            perm_y=(1, 0, 2),
+        )
+        wo_a_out = wo_a_out.reshape(batch_size * seq_length, -1).to(torch.bfloat16)
         wo_a_quant, wo_a_scale = _dynamic_quant_per_token(wo_a_out)
         wo_b_out = self.wo_b(wo_a_quant, wo_a_scale)
         return wo_b_out.view(batch_size, seq_length, -1)
@@ -1355,8 +1531,9 @@ class DeepseekV4Attention(nn.Module):
 
 class DeepseekV4SharedExpert(nn.Module):
 
-    def __init__(self, config: DeepseekV4Config):
+    def __init__(self, config: DeepseekV4Config, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size * config.n_shared_experts
         self.swiglu_limit = config.swiglu_limit
@@ -1370,24 +1547,36 @@ class DeepseekV4SharedExpert(nn.Module):
         nn.init.ones_(self.gate_quant.inv_smooth_scale)
         nn.init.ones_(self.up_quant.inv_smooth_scale)
         nn.init.ones_(self.intermediate_quant.inv_smooth_scale)
+        self._gate_up_weight_cache = None
+        self._gate_up_weight_scale_cache = None
+
+    def _get_gate_up_weight(self):
+        if (
+            self._gate_up_weight_cache is None
+            or self._gate_up_weight_cache.device != self.gate_proj.weight.device
+        ):
+            self._gate_up_weight_cache = torch.cat(
+                (self.gate_proj.weight, self.up_proj.weight), dim=0
+            ).transpose(0, 1).contiguous()
+            self._gate_up_weight_scale_cache = torch.cat(
+                (self.gate_proj.weight_scale, self.up_proj.weight_scale), dim=0
+            ).contiguous().view(-1).float()
+        return self._gate_up_weight_cache, self._gate_up_weight_scale_cache
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
         x_flat = x.reshape(-1, self.hidden_size).to(torch.bfloat16)
-        x_quant, activation_scale = self.gate_quant(x_flat)
-
-        gate_up_weight = torch.cat((self.gate_proj.weight, self.up_proj.weight), dim=0).transpose(0, 1).contiguous()
-        gate_up_weight_scale = torch.cat(
-            (self.gate_proj.weight_scale, self.up_proj.weight_scale), dim=0
-        ).contiguous()
-        merged_x = torch_npu.npu_quant_matmul(
-            x_quant,
-            gate_up_weight,
-            gate_up_weight_scale.view(-1).float(),
-            pertoken_scale=None,
-            bias=None,
-            output_dtype=torch.int32,
-        )
+        gate_up_weight, gate_up_weight_scale = self._get_gate_up_weight()
+        with _profile_timer(self.layer_idx, "shared_expert_gate_up") if hasattr(self, "layer_idx") else nullcontext():
+            x_quant, activation_scale = self.gate_quant(x_flat)
+            merged_x = torch_npu.npu_quant_matmul(
+                x_quant,
+                gate_up_weight,
+                gate_up_weight_scale,
+                pertoken_scale=None,
+                bias=None,
+                output_dtype=torch.int32,
+            )
 
         swiglu_limit_args = {}
         if self.swiglu_limit is not None and self.swiglu_limit > 0:
@@ -1399,17 +1588,19 @@ class DeepseekV4SharedExpert(nn.Module):
                     "glu_bias": 0,
                 }
             )
-        intermediate_quant, intermediate_scale = torch_npu.npu_dequant_swiglu_clamp_quant(
-            merged_x,
-            weight_scale=gate_up_weight_scale.view(-1).float(),
-            quant_scale=self.intermediate_quant.inv_smooth_scale.to(dtype=torch.float32),
-            quant_mode=1,
-            activate_left=True,
-            activation_scale=activation_scale.view(-1),
-            **swiglu_limit_args,
-        )
-        intermediate_scale = intermediate_scale.unsqueeze(-1)
-        return self.down_proj(intermediate_quant, intermediate_scale).view(*orig_shape)
+        with _profile_timer(self.layer_idx, "shared_expert_swiglu") if hasattr(self, "layer_idx") else nullcontext():
+            intermediate_quant, intermediate_scale = torch_npu.npu_dequant_swiglu_clamp_quant(
+                merged_x,
+                weight_scale=gate_up_weight_scale,
+                quant_scale=self.intermediate_quant.inv_smooth_scale.to(dtype=torch.float32),
+                quant_mode=1,
+                activate_left=True,
+                activation_scale=activation_scale.view(-1),
+                **swiglu_limit_args,
+            )
+            intermediate_scale = intermediate_scale.unsqueeze(-1)
+        with _profile_timer(self.layer_idx, "shared_expert_down") if hasattr(self, "layer_idx") else nullcontext():
+            return self.down_proj(intermediate_quant, intermediate_scale).view(*orig_shape)
 
 
 class DeepseekV4MoE(nn.Module):
@@ -1462,7 +1653,7 @@ class DeepseekV4MoE(nn.Module):
             torch.ones(self.experts_per_rank, config.moe_intermediate_size, dtype=torch.float32),
         )
 
-        self.shared_experts = DeepseekV4SharedExpert(config)
+        self.shared_experts = DeepseekV4SharedExpert(config, layer_idx)
 
         self.gate = nn.Parameter(torch.empty(config.n_routed_experts, config.hidden_size, dtype=torch.float32))
 
@@ -1789,6 +1980,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         is_prefill: bool = True,
         **kwargs,
     ) -> torch.Tensor:
+        if _DSV4_LAYER_PROFILE:
+            _profile_sync()
+            layer_start = time.perf_counter()
         residual = hidden_states
         hidden_states, post, comb = OpKernel.hc_pre(
             hidden_states, self.hc_attn_fn, self.hc_attn_scale,
@@ -1796,12 +1990,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.norm_eps, self.hc_eps
         )
         hidden_states = self.attn_norm(hidden_states)
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states, attention_mask=attention_mask,
-            past_key_values=past_key_values, use_cache=use_cache,
-            position_embeddings=position_embeddings,
-            is_prefill=is_prefill,
-        )
+        with _profile_timer(self.layer_idx, "attention_total"):
+            hidden_states, _ = self.self_attn(
+                hidden_states=hidden_states, attention_mask=attention_mask,
+                past_key_values=past_key_values, use_cache=use_cache,
+                position_embeddings=position_embeddings,
+                is_prefill=is_prefill, **kwargs,
+            )
         hidden_states = OpKernel.hc_post(hidden_states, residual, post, comb)
 
         residual = hidden_states
@@ -1811,9 +2006,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.norm_eps, self.hc_eps
         )
         hidden_states = self.ffn_norm(hidden_states)
-        hidden_states = self.mlp(hidden_states, input_ids=input_ids, is_prefill=is_prefill)
+        with _profile_timer(self.layer_idx, "moe"):
+            hidden_states = self.mlp(hidden_states, input_ids=input_ids, is_prefill=is_prefill)
         hidden_states = OpKernel.hc_post(hidden_states, residual, post, comb)
 
+        if _DSV4_LAYER_PROFILE:
+            _profile_sync()
+            _profile_record(self.layer_idx, "layer_total", (time.perf_counter() - layer_start) * 1000.0)
         return hidden_states
 
 
@@ -1878,8 +2077,15 @@ class DeepseekV4Model(nn.Module):
                 next_n=self.config.next_n,
             )
 
-        past_len = int(past_key_values.get_seq_length(0).max().item())
-        position_ids = torch.arange(past_len, past_len + seq_len, device=device, dtype=torch.long).unsqueeze(0)
+        if attention_mask is not None and is_prefill:
+            q_lens = attention_mask.to(device=device, dtype=torch.int32).sum(dim=-1)
+            position_ids = (attention_mask.to(device=device, dtype=torch.long).cumsum(dim=-1) - 1).clamp(min=0)
+            position_ids = position_ids.masked_fill(~attention_mask.to(dtype=torch.bool), 1)
+        else:
+            q_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+            past_lens = past_key_values.get_seq_length(0).to(device=device, dtype=torch.long)
+            offsets = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+            position_ids = past_lens.unsqueeze(1) + offsets
 
         hidden_states = self.embed_tokens(input_ids)
         cos, sin = self.rotary_emb(hidden_states, position_ids)
@@ -1899,7 +2105,7 @@ class DeepseekV4Model(nn.Module):
                 hidden_states, attention_mask=attention_mask,
                 position_embeddings=layer_position_embeddings, position_ids=position_ids,
                 past_key_values=past_key_values, use_cache=use_cache,
-                input_ids=input_ids, is_prefill=is_prefill, **kwargs,
+                input_ids=input_ids, is_prefill=is_prefill, q_lens=q_lens, **kwargs,
             )
 
         hidden_states = self._hc_head(hidden_states)
@@ -1951,6 +2157,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             past_key_values=past_key_values, use_cache=use_cache,
             is_prefill=is_prefill, **kwargs,
         )
+        if is_prefill and attention_mask is not None:
+            q_lens = attention_mask.to(dtype=torch.int32).sum(dim=-1)
+            gather_index = (q_lens - 1).unsqueeze(1).unsqueeze(2).repeat(1, 1, hidden_states.shape[-1])
+            hidden_states = torch.gather(hidden_states, 1, gather_index)
         hidden_states_flat = hidden_states.view(-1, self.config.hidden_size).to(torch.bfloat16)
         logits = self.lm_head(hidden_states_flat)
         logits = logits.view(*hidden_states.shape[:-1], self.config.vocab_size)

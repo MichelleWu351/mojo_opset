@@ -31,23 +31,27 @@ export MOJO_DISABLE_ASSERTION_REWRITE="${MOJO_DISABLE_ASSERTION_REWRITE:-1}"
 
 EP_SIZE="${EP_SIZE:-8}"
 NUM_LAYERS="${LLM_NUM_LAYERS:-43}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16}"
-PROMPT="${PROMPT:-你好}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
+PA_MAX_LENGTH="${PA_MAX_LENGTH:-2048}"
+PROMPT="${PROMPT:-你现在是昇腾推理工程助手。请用两句话说明多 batch 推理的主要价值，并补一句部署时最该注意的风险。}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
 
 cd "$PROJECT_ROOT" || exit 1
 
 if [ "$EP_SIZE" -eq 1 ]; then
-    echo "EP=1, single card inference"
+    echo "EP=1, single card inference, batch_size=${BATCH_SIZE}"
     ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}" \
     "${PYTHON_BIN}" -m examples.llm_inference \
         --model_path "${MODEL_PATH}" \
         --device "${DEVICE:-npu}" \
         --num_layers "${NUM_LAYERS}" \
         --max_new_tokens "${MAX_NEW_TOKENS}" \
+        --pa_max_length "${PA_MAX_LENGTH}" \
         --prompt "${PROMPT}" \
-        --ep_size 1
+        --ep_size 1 \
+        --batch_size "${BATCH_SIZE}"
 else
-    echo "EP=${EP_SIZE}, multi-card inference"
+    echo "EP=${EP_SIZE}, multi-card inference, batch_size=${BATCH_SIZE}"
 
     MA_NUM_GPUS="$EP_SIZE"
 
@@ -79,8 +83,10 @@ else
             --device "${DEVICE:-npu}" \
             --num_layers "${NUM_LAYERS}" \
             --max_new_tokens "${MAX_NEW_TOKENS}" \
+            --pa_max_length "${PA_MAX_LENGTH}" \
             --prompt "${PROMPT}" \
-            --ep_size "${EP_SIZE}" &
+            --ep_size "${EP_SIZE}" \
+            --batch_size "${BATCH_SIZE}" &
 
         PIDS+=($!)
     done
