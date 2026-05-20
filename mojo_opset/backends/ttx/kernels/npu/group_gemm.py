@@ -224,6 +224,7 @@ def m_grouped_matmul_impl(
         strideBN,
         strideBK,
         multibuffer=True,
+        sync_solver=False,
     )
     return C
 
@@ -323,5 +324,5 @@ def k_grouped_matmul_impl(
         assert M % META["BLOCK_M"] == 0, "Only support when M is a multiple of BLOCK_M"
         return (num_cores,)
 
-    _k_grouped_matmul_kernel[grid](A, B, C, size_per_group, num_groups, M, N, multibuffer=True)
+    _k_grouped_matmul_kernel[grid](A, B, C, size_per_group, num_groups, M, N, multibuffer=True,sync_solver=False)
     return C
