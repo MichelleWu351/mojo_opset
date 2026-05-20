@@ -1524,6 +1524,320 @@ class MojoPagedPrefillNSA(MojoOperator):
 
     extra_repr = _nsa_extra_repr
 
+def get_scale_and_quant(
+    x: torch.Tensor,
+    scale: Optional[torch.Tensor],
+    quant_dims,
+    q_max: int = 127,
+    q_min: int = -128,
+    eps: float = 1e-6,
+    quant_dtype: torch.dtype = torch.int8,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert scale is None or isinstance(scale, torch.Tensor), \
+        f"scale must be None or Tensor, got {type(scale)}"
+
+    if scale is None:
+        scale = x.abs().amax(dim=quant_dims, keepdim=True).float() / q_max
+        scale = scale.clamp(min=eps)
+    elif scale.ndim != x.ndim:
+        # Caller passed a non-keepdim scale; restore the reduced dims.
+        dims = (quant_dims,) if isinstance(quant_dims, int) else tuple(quant_dims)
+        dims = sorted({d % x.ndim for d in dims})
+        for d in dims:
+            scale = scale.unsqueeze(d)
+
+    q = torch.clamp(torch.round(x.float() / scale), q_min, q_max).to(quant_dtype)
+    return q, scale
+
+
+def per_block_int8(
+    x: torch.Tensor,
+    xm: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    *,
+    blk: int = 16,
+    seq_dim: int = 0,
+    q_max: int = 127,
+    q_min: int = -128,
+):
+    """Per-block int8 quantization (one scale per block (blk*token) ).
+    - x: The tensor need to quant, shape is [T, H, D].
+    - xm: The mean tensor, if have, it is used to smooth x, shape is [T, H, D]; otherwise None.
+    - scale: The scale tensor, if have it is used to quant scale, shape is [num_blocks, H]; otherwise None.
+    - blk: The block size, mean one scale per blk token.
+    - seq_dim: The sequence dim, used to quant.
+    - q_max: The max quant number.
+    - q_min: The min quant number.
+    
+    Return:
+        x_q: result tensor, shape is [T, H, D].
+        scale: using to dequant, is already repeat interleave, so the shape is [T, H, 1], easy to broadcast.
+    """
+
+    if xm is not None:
+        x = x - xm
+
+    seq_dim_norm = seq_dim % x.ndim
+    seq_len = x.shape[seq_dim_norm]
+    assert seq_len % blk == 0, (
+        f"per_block_int8: dim {seq_dim_norm} (size {seq_len}) must be divisible by blk={blk}"
+    )
+    num_blocks = seq_len // blk
+
+    # Reshape seq_dim from S into (S // blk, blk) so the inner ``blk`` axis
+    # can be reduced independently.
+    new_shape = (
+        list(x.shape[:seq_dim_norm])
+        + [num_blocks, blk]
+        + list(x.shape[seq_dim_norm + 1:])
+    )
+    x_reshaped = x.reshape(new_shape)
+
+    q, scale_kd = get_scale_and_quant(
+        x_reshaped,
+        scale,
+        quant_dims=seq_dim_norm + 1,
+        q_max=q_max,
+        q_min=q_min,
+    )
+
+    q = q.reshape(x.shape)
+    scale_out = scale_kd.squeeze(seq_dim_norm + 1).repeat_interleave(num_blocks, dim=seq_dim_norm)
+    return q, scale_out
+
+
+def per_token_int8(
+    x: torch.Tensor,
+    xm: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    *,
+    q_max: int = 127,
+    q_min: int = -127,
+):
+    """Per-token int8 quantization (one scale per token).
+    - x: The tensor need to quant, shape is [T, H, D].
+    - xm: The mean tensor, if have, it is used to smooth x, shape is [T, H, D]; otherwise None.
+    - scale: The scale tensor, if have it is used to quant scale, shape is [T, H]; otherwise None.
+    - q_max: The max quant number.
+    - q_min: The min quant number.
+    
+    Return:
+        x_q: result tensor, shape is [T, H, D].
+        scale: using to dequant, shape is [T, H, 1], easy to broadcast.
+    """
+    if xm is not None:
+        x = x - xm
+    return get_scale_and_quant(x, scale, quant_dims=-1, q_max=q_max, q_min=q_min)
+
+
+def per_channel_int8(
+    x: torch.Tensor,
+    xm: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    *,
+    seq_dim: int = 0,
+    q_max: int = 127,
+    q_min: int = -127,
+):
+    """Per-channel int8 quantization (one scale per channel).
+    - x: The tensor need to quant, shape is [T, H, D].
+    - xm: The mean tensor, if have, it is used to smooth x, shape is [T, H, D]; otherwise None.
+    - scale: The scale tensor, if have it is used to quant scale, shape is [H, D]; otherwise None.
+    - seq_dim: The sequence dim, used to quant.
+    - q_max: The max quant number.
+    - q_min: The min quant number.
+    
+    Return:
+        x_q: result tensor, shape is [T, H, D].
+        scale: using to dequant, shape is [1, H, D], easy to broadcast.
+    """
+    if xm is not None:
+        x = x - xm
+    return get_scale_and_quant(x, scale, quant_dims=seq_dim, q_max=q_max, q_min=q_min)
+
+
+class MojoPagedPrefillSageGQA(MojoOperator):
+    def __init__(
+        self,
+        is_causal: bool = True,
+        gqa_layout: str = "AABB",
+        query_dtype: torch.dtype = torch.bfloat16,
+        context_dtype: torch.dtype = torch.int8,
+        compute_dtype: torch.dtype = torch.bfloat16,
+    ):
+        """
+        Initialize the Paged Prefill GQA attention operator with common parameters.
+        Parameter descriptions:
+        - gqa_layout (str): GQA head grouping layout, values {"ABAB","AABB"}, default "ABAB".
+        - is_causal (bool): Whether to enable causal masking, default True.
+        - query_dtype (torch.dtype): the dtype for query, default torch.bfloat16 for non-quantized query.
+        - context_dtype (torch.dtype): The stored KV-cache dtype before dequantization, default torch.int8.
+        - compute_dtype (torch.dtype): The quant matmul dtype for Q@K and P@V, default torch.bfloat16.       
+        """
+        super().__init__()
+
+        if gqa_layout not in ["ABAB", "AABB"]:
+            raise ValueError(f"gqa_layout must be one of ['ABAB', 'AABB'], got {gqa_layout}")
+
+        self.is_causal = is_causal
+        self.gqa_layout = gqa_layout
+        self.query_dtype = query_dtype
+        self.context_dtype = context_dtype
+        self.compute_dtype = compute_dtype
+        assert self.query_dtype == torch.int8, f"Unsupported query dtype {self.query_dtype}"
+        assert self.context_dtype == torch.int8, f"Quant attention support int8 context only, but got {self.context_dtype}"
+        assert self.compute_dtype == torch.int8, f"Unsupported compute dtype {self.compute_dtype}"
+        if self.compute_dtype == torch.int8:
+            bits = 8
+            self.qmax = 2 ** (bits - 1) - 1
+            self.qmin = -(2 ** (bits - 1))
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        query_scale: Optional[torch.Tensor] = None,
+        key_scale: Optional[torch.Tensor] = None,
+        value_scale: Optional[torch.Tensor] = None,
+        softmax_scale: Optional[float] = None,
+        cu_total_seq_lens: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        max_q_lens: Optional[int] = None,
+        max_total_seq_lens: Optional[int] = None,
+    ) -> Tuple[Any]:
+        """
+        Paged prefill sage attention with grouped query heads (GQA) using a blocked KV cache.
+
+        Args:
+            query (torch.Tensor): Query tokens of shape (T, Hq, D).
+            key_cache (torch.Tensor): Key cache of shape (N_blocks, Hkv, block_size, D).
+            value_cache (torch.Tensor): Value cache of shape (N_blocks, Hkv, block_size, D).
+            cu_q_lens (torch.Tensor): Cumulative query lengths, shape (B+1,);
+                `cu_q_lens[i]` is the start offset for query at batch i; `cu_q_lens[-1] == T`.
+            block_tables (torch.Tensor): Logical-to-physical block IDs per batch,
+                shape (B, num_blocks).
+            query_scale (torch.Tensor): if using per token dynamic quant it should be None, otherwise its shape is (T, Hq) with dtype fp32.
+            key_scale (torch.Tensor): Key scale for quant, should be None if using per token dynamic quant, otherwise shape is (N_blocks, Hkv, block_size) with dtype fp32.
+            value_scale (torch.Tensor): Value scale for quant, should be None if using per channel dynamic quant, otherwise shape is [Hkv, D] with dtype fp32.
+            softmax_scale (Optional[float]): Attention scaling factor; defaults to 1/sqrt(D).
+            cu_total_seq_lens (Optional[torch.Tensor]): Cumulative total KV lengths, shape (B+1,);
+                `cu_total_seq_lens[i+1] - cu_total_seq_lens[i]` is the total visible KV length for batch i.
+                If None, defaults to `cu_q_lens`.
+            mask (Optional[torch.Tensor]): Attention mask; defaults to None.
+                If mask is None, it means a full mask or causal mask based on `is_causal`.
+                If mask is not None, and is_causal=False, applies the mask to the attention scores.
+                Currently we do not constrain the shape of mask, it is recommended be of shape (B, T, T) or (T, T),
+                where B is the block size, and T >= max(max(total_seq_lens), max(q_lens)).
+
+        Returns:
+            torch.Tensor: Attention output of shape (T, Hq, D).
+
+        Notes:
+            - If Hq != Hkv, expands K/V heads to match Hq via repeat_interleave.
+            - Applies a causal lower-triangular mask and restricts attention within each sequence.
+            - Softmax is computed in float32 and cast back to the input dtype.
+            - Despite the type annotation Tuple[Any], this implementation returns a single tensor.
+        """
+        assert_paged_prefill_contract(cu_q_lens, block_tables, cu_total_seq_lens)
+        total_q_tokens, num_q_heads, head_dim = query.shape
+        _, num_kv_heads, block_size, _ = key_cache.shape
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(head_dim)
+
+        outputs = torch.zeros(total_q_tokens, num_q_heads, head_dim, dtype=query.dtype, device=query.device)
+
+        q_lens = _seq_lens_from_cu(cu_q_lens)
+        total_seq_lens = q_lens if cu_total_seq_lens is None else _seq_lens_from_cu(cu_total_seq_lens)
+        batch_size = len(q_lens)
+
+        # apply per_token_int8 quant, quant_dim = -1
+        assert query_scale is None, "dynamic Q quant, query_scale should be None"
+        assert key_scale is None, "dynamic K quant, key_scale should be None"
+        # assert value_scale is not None, "static V quant, value should not be None"
+        query, query_scale = per_token_int8(x=query, scale=query_scale, q_max=self.q_max, q_min=self.q_min)
+        key_cache, key_scale = per_token_int8(x=key_cache, scale=key_scale, q_max=self.q_max, q_min=self.q_min)
+
+        for i in range(batch_size):
+            q_seq_len = q_lens[i].item()
+            start_loc = cu_q_lens[i].item()
+            end_loc = cu_q_lens[i + 1].item()
+            q = query[start_loc:end_loc]
+            kv_seq_len = total_seq_lens[i].item()
+            if q_seq_len == 0 or kv_seq_len <= 0:
+                continue
+            if block_tables[i, 0].item() < 0:
+                raise ValueError("Paged prefill requires a valid block table for rows with kv lens > 0.")
+
+            num_blocks_for_seq = (kv_seq_len + block_size - 1) // block_size
+            k_unpadded = torch.zeros(kv_seq_len, num_kv_heads, head_dim, dtype=query.dtype, device=query.device)
+            # k_scale_unpadded: [kv_seq_len, num_kv_heads, 1]
+            k_scale_unpadded = torch.zeros(kv_seq_len, num_kv_heads, 1, dtype=key_scale.dtype, device=key_scale.device)
+            v_unpadded = torch.zeros(kv_seq_len, num_kv_heads, head_dim, dtype=query.dtype, device=query.device)
+
+
+            for j in range(num_blocks_for_seq):
+                physical_block_id = block_tables[i, j].item()
+                if physical_block_id < 0:
+                    break
+
+                start_pos_in_seq = j * block_size
+                end_pos_in_seq = min(start_pos_in_seq + block_size, kv_seq_len)
+                tokens_in_block = end_pos_in_seq - start_pos_in_seq
+
+                k_slice = key_cache[physical_block_id, :, :tokens_in_block, :]
+
+                k_unpadded[start_pos_in_seq:end_pos_in_seq, :, :] = k_slice.permute(1, 0, 2)
+
+                k_scale_slice = key_scale[physical_block_id, :, :tokens_in_block, :]
+                k_scale_unpadded[start_pos_in_seq:end_pos_in_seq, :, :] = k_scale_slice.permute(1, 0, 2)
+
+                v_slice = value_cache[physical_block_id, :, :tokens_in_block, :]
+                v_unpadded[start_pos_in_seq:end_pos_in_seq, :, :] = v_slice.permute(1, 0, 2)
+
+            if num_q_heads != num_kv_heads:
+                if self.gqa_layout == "AABB":
+                    k_expanded = k_unpadded.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+                    k_scale_expanded = k_scale_unpadded.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+                    v_expanded = v_unpadded.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+                else:
+                    k_expanded = k_unpadded.repeat((1, num_q_heads // num_kv_heads, 1))
+                    k_scale_expanded = k_scale_unpadded.repeat((1, num_q_heads // num_kv_heads, 1))
+                    v_expanded = v_unpadded.repeat((1, num_q_heads // num_kv_heads, 1))
+            else:
+                k_expanded = k_unpadded
+                k_scale_expanded = k_scale_unpadded
+                v_expanded = v_unpadded
+
+            q_scale = query_scale[start_loc:end_loc]
+            # npu don't support int8
+            q, k_expanded = q.float(), k_expanded.float()
+            attn_scores = torch.einsum("thd,khd->thk", q, k_expanded).float() * softmax_scale * q_scale * k_scale_expanded
+            if self.is_causal:
+                attn_mask = torch.ones(q_seq_len, kv_seq_len, device=query.device, dtype=torch.bool).tril(
+                    kv_seq_len - q_seq_len
+                )
+                attn_scores.masked_fill_(~attn_mask.unsqueeze(1), -torch.inf)
+            elif mask is not None:
+                if mask.dim() == 2:
+                    attn_mask = mask
+                else:
+                    attn_mask = mask[i]
+                attn_mask = attn_mask[kv_seq_len - q_seq_len : kv_seq_len, :kv_seq_len]
+                attn_scores.masked_fill_(~attn_mask.unsqueeze(1), -torch.inf)
+
+            attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
+            attn_probs_int8, attn_probs_scale = per_token_int8(x=attn_probs, q_max=self.q_max, q_min=self.q_min)
+            v_expanded_int8, v_expanded_scale = per_channel_int8(x=v_expanded, seq_dim=-2, q_max=self.q_max, q_min=self.q_min)
+            attn_probs_int8, v_expanded_int8 = attn_probs_int8.float(), v_expanded_int8.float()
+            outputs[start_loc:end_loc] = torch.einsum("thk,khd->thd", attn_probs_int8, v_expanded_int8) * attn_probs_scale * v_expanded_scale
+        return outputs
+
+    def extra_repr(self) -> str:
+        return f"{self.is_causal=}, {self.gqa_layout=}, {self.query_dtype=}, {self.context_dtype=}, {self.compute_dtype=}, {self.q_max=}, {self.q_min=}".replace("self.", "")
+
 
 __all__ = [
     "MojoPrefillMLA",
