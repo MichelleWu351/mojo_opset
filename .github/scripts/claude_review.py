@@ -6,6 +6,7 @@ result as an issue comment on the PR.
 """
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -15,6 +16,7 @@ import urllib.request
 ENDPOINT = "https://f7xnt9mg.fn.bytedance.net"
 MODEL = "claude-opus-4-7"
 MAX_DIFF_BYTES = 200_000
+GITHUB_COMMENT_LIMIT = 65_000  # GitHub hard limit is 65536; leave headroom
 
 
 def env(name: str) -> str:
@@ -86,11 +88,19 @@ def main() -> None:
             with internal_opener.open(req, timeout=300) as resp:
                 data = json.loads(resp.read())
             break
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+        except urllib.error.HTTPError as e:
+            last_err = e
+            print(f"attempt {attempt + 1} HTTP {e.code}: {e!r}", file=sys.stderr)
+            # Don't retry hard auth/permission/format failures.
+            if 400 <= e.code < 500 and e.code not in (408, 429):
+                break
+            if attempt < 2:
+                time.sleep(2 ** attempt + random.uniform(0, 1))
+        except (urllib.error.URLError, TimeoutError) as e:
             last_err = e
             print(f"attempt {attempt + 1} failed: {e!r}", file=sys.stderr)
             if attempt < 2:
-                time.sleep(2 ** attempt)
+                time.sleep(2 ** attempt + random.uniform(0, 1))
     if data is None:
         sys.exit(f"LLM call failed after retries: {last_err!r}")
 
@@ -106,6 +116,9 @@ def main() -> None:
     comment = f"## Claude Code Review\n\n{review}"
     if truncated:
         comment += "\n\n_Note: the diff was truncated for review._"
+    if len(comment) > GITHUB_COMMENT_LIMIT:
+        suffix = "\n\n_(comment truncated to fit GitHub limit)_"
+        comment = comment[: GITHUB_COMMENT_LIMIT - len(suffix)] + suffix
 
     # GitHub API needs the outbound proxy.
     if proxy:

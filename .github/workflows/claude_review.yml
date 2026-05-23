@@ -67,5 +67,17 @@ jobs:
             -c '
               set -euo pipefail
               git config --global --add safe.directory /workspace
-              python3 /workspace/.github/scripts/claude_review.py
+              cd /workspace
+              # Run the version of the review script that exists at the PR base
+              # ref, not the PR head, so a PR cannot modify the script to
+              # exfiltrate secrets. Fall back to the PR version only if the
+              # script does not yet exist at base (first-time bootstrap).
+              if git cat-file -e "$BASE_SHA:.github/scripts/claude_review.py" 2>/dev/null; then
+                git show "$BASE_SHA:.github/scripts/claude_review.py" > /tmp/claude_review.py
+                echo "using review script from BASE_SHA=$BASE_SHA"
+                python3 /tmp/claude_review.py
+              else
+                echo "WARN: review script not present at BASE_SHA, using PR head version (bootstrap)"
+                python3 /workspace/.github/scripts/claude_review.py
+              fi
             '
