@@ -226,7 +226,7 @@ def n_gram_decode_kernel(
                     output_ids + bid * output_stride_0 + tl.arange(0, MTP_STEP)[:, None] * output_stride_1 + block_offsets[None, :] * output_stride_2,
                     # output_ids + bid * output_stride_0 + output_offsets,
                     n_gram_ids.to(output_ids.dtype.element_ty),
-                    mask= block_mask_1  #tl.view(block_mask, (1, BLOCK_SIZE_N)),
+                    mask=block_mask_1
                 )
 
             else:
