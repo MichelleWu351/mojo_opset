@@ -1524,155 +1524,6 @@ class MojoPagedPrefillNSA(MojoOperator):
 
     extra_repr = _nsa_extra_repr
 
-def get_scale_and_quant(
-    x: torch.Tensor,
-    scale: Optional[torch.Tensor],
-    quant_dims,
-    q_max: int = 127,
-    q_min: int = -128,
-    eps: float = 1e-6,
-    quant_dtype: torch.dtype = torch.int8,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert scale is None or isinstance(scale, torch.Tensor), \
-        f"scale must be None or Tensor, got {type(scale)}"
-
-    if scale is None:
-        scale = x.abs().amax(dim=quant_dims, keepdim=True).float() / q_max
-        scale = scale.clamp(min=eps)
-
-    q = torch.clamp(torch.round(x.float() / scale), q_min, q_max).to(quant_dtype)
-    return q, scale
-
-def quant_p_int8(
-    x: torch.Tensor,
-    q_max: int = 127,
-    q_min: int = -128
-):
-    """ quant for attn_probs.
-    Since attn_probs values are in (0, 1] after softmax, quantization is
-    simplified to a fixed-scale multiplication (same approach as SageAttention).
-    No dynamic absmax computation is needed.
-
-    - x: The tensor need to quant.
-    - q_max: The max quant number.
-    - q_min: The min quant number.
-
-    Return:
-        x_q: result tensor.
-        scale: using to dequant.
-    """
-    x_q = x * q_max
-    return x_q.to(torch.int8), 1./q_max
-
-
-def per_block_int8(
-    x: torch.Tensor,
-    xm: Optional[torch.Tensor] = None,
-    scale: Optional[torch.Tensor] = None,
-    *,
-    blk: int = 16,
-    dim1: int = -2,
-    dim2: int = -1,
-    q_max: int = 127,
-    q_min: int = -128,
-):
-    """Per-block int8 quantization (one scale per block).
-    - x: The tensor need to quant.
-    - xm: The mean tensor, if have, it is used to smooth x; otherwise None.
-    - scale: The scale tensor, if have it is used to quant scale; otherwise None.
-    - blk: The block size, mean one scale per blk token.
-    - dim1: The dim to split blocks.
-    - dim2: The other dim to quant.
-    - q_max: The max quant number.
-    - q_min: The min quant number.
-    
-    Return:
-        x_q: result tensor.
-        scale: using to dequant, is already repeat interleave, easy to broadcast.
-    """
-
-    if xm is not None:
-        x = x - xm
-    dim1_norm = dim1 % x.ndim
-    dim2_norm = dim2 % x.ndim
-
-    seq_len = x.shape[dim1_norm]
-    assert seq_len % blk == 0, (
-        f"per_block_int8: dim {dim1_norm} (size {seq_len}) must be divisible by blk={blk}"
-    )
-    num_blocks = seq_len // blk
-
-    # Reshape seq_dim from S into (S // blk, blk) so the inner ``blk`` axis
-    # can be reduced independently.
-    new_shape = (
-        list(x.shape[:dim1_norm])
-        + [num_blocks, blk]
-        + list(x.shape[dim1_norm + 1:])
-    )
-    x_reshaped = x.reshape(new_shape)
-
-    q, scale_kd = get_scale_and_quant(
-        x_reshaped,
-        scale,
-        quant_dims=(dim1_norm, dim2_norm),
-        q_max=q_max,
-        q_min=q_min,
-    )
-
-    q = q.reshape(x.shape)
-    scale_out = scale_kd.squeeze(dim1_norm + 1).repeat_interleave(num_blocks, dim=dim1_norm)
-    return q, scale_out
-
-
-def per_token_int8(
-    x: torch.Tensor,
-    xm: Optional[torch.Tensor] = None,
-    scale: Optional[torch.Tensor] = None,
-    *,
-    q_max: int = 127,
-    q_min: int = -128,
-):
-    """Per-token int8 quantization (one scale per token).
-    - x: The tensor need to quant, shape is [*, D], * can be (T, H)
-    - xm: The mean tensor, if have, it is used to smooth x; otherwise None. e.g. shape is [T, H, 1] if x.shape == [T, H, D], mean average in feature dim.
-    - scale: The scale tensor, if have it is used to quant scale, otherwise None. e.g. shape is [T, H] if x.shape == [T, H, D].
-    - q_max: The max quant number.
-    - q_min: The min quant number.
-    
-    Return:
-        x_q: result tensor, shape is [*, D].
-        scale: using to dequant, shape is [*, 1], easy to broadcast.
-    """
-    if xm is not None:
-        x = x - xm
-    return get_scale_and_quant(x, scale, quant_dims=-1, q_max=q_max, q_min=q_min)
-
-
-def per_channel_int8(
-    x: torch.Tensor,
-    xm: Optional[torch.Tensor] = None,
-    scale: Optional[torch.Tensor] = None,
-    *,
-    seq_dim: int = 0,
-    q_max: int = 127,
-    q_min: int = -128,
-):
-    """Per-channel int8 quantization (one scale per channel).
-    - x: The tensor need to quant, shape is [T, H, D].
-    - xm: The mean tensor, if have, it is used to smooth x, shape is [T, H, D]; otherwise None.
-    - scale: The scale tensor, if have it is used to quant scale, shape is [H, D]; otherwise None.
-    - seq_dim: The sequence dim, used to quant.
-    - q_max: The max quant number.
-    - q_min: The min quant number.
-    
-    Return:
-        x_q: result tensor, shape is [T, H, D].
-        scale: using to dequant, shape is [1, H, D], easy to broadcast.
-    """
-    if xm is not None:
-        x = x - xm
-    return get_scale_and_quant(x, scale, quant_dims=seq_dim, q_max=q_max, q_min=q_min)
-
 
 class MojoPagedPrefillSageGQA(MojoOperator):
     def __init__(
@@ -1761,7 +1612,21 @@ class MojoPagedPrefillSageGQA(MojoOperator):
         """
         assert_paged_prefill_contract(cu_q_lens, block_tables, cu_total_seq_lens)
         total_q_tokens, num_q_heads, head_dim = query.shape
-        _, num_kv_heads, block_size, _ = key_cache.shape
+        num_blocks, num_kv_heads, block_size, _ = key_cache.shape
+
+        assert query_scale is not None, "Q should be dynamic quant, and pass scale to MojoPagedPrefillSageGQA"
+        assert key_scale is not None, "K should be dynamic quant, and pass scale to MojoPagedPrefillSageGQA"
+        assert value_scale is not None, "V should be static quant, and pass scale to MojoPagedPrefillSageGQA"
+        assert query_scale.shape == (total_q_tokens, num_q_heads), f"query_scale.shape should be ({total_q_tokens}, {num_q_heads}), got {query_scale.shape}"
+        assert key_scale.shape == (num_blocks, num_kv_heads, block_size), f"key_scale.shape should be ({num_blocks}, {num_kv_heads}, {block_size}), got {key_scale.shape}"
+        assert value_scale.shape == (num_kv_heads, head_dim), f"value_scale.shape should be ({num_kv_heads}, {head_dim}), got {value_scale.shape}"
+        # query_scale: [T, Hq] -> [T, Hq, 1], key_scale: [N_blocks, Hkv, block_size] -> [N_blocks, Hkv, block_size, 1], value_scale: [Hkv, D] -> [1, Hkv, 1, D]
+        query_scale = query_scale[..., None]
+        key_scale = key_scale[..., None]
+        value_scale = value_scale[None, :, :]
+        blk = self.p_quant_block
+
+
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(head_dim)
 
@@ -1770,15 +1635,6 @@ class MojoPagedPrefillSageGQA(MojoOperator):
         q_lens = _seq_lens_from_cu(cu_q_lens)
         total_seq_lens = q_lens if cu_total_seq_lens is None else _seq_lens_from_cu(cu_total_seq_lens)
         batch_size = len(q_lens)
-
-        assert query_scale is not None, "Q should be dynamic quant, and pass scale to MojoPagedPrefillSageGQA"
-        assert key_scale is not None, "K should be dynamic quant, and pass scale to MojoPagedPrefillSageGQA"
-        assert value_scale is not None, "V should be static quant, and pass scale to MojoPagedPrefillSageGQA"
-        # query_scale: [T, Hq] -> [T, Hq, 1], key_scale: [N_blocks, Hkv, block_size] -> [N_blocks, Hkv, block_size, 1], value_scale: [Hkv, D] -> [1, Hkv, 1, D]
-        query_scale = query_scale[..., None]
-        key_scale = key_scale[..., None]
-        value_scale = value_scale[None, :, :]
-        blk = self.p_quant_block
 
         for i in range(batch_size):
             q_seq_len = q_lens[i].item()
@@ -1856,7 +1712,7 @@ class MojoPagedPrefillSageGQA(MojoOperator):
                 attn_scores.masked_fill_(~attn_mask.unsqueeze(1), -torch.inf)
 
             attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
-            attn_probs_quant, attn_probs_scale = quant_p_int8(attn_probs, self.qmax, self.qmin)
+            attn_probs_quant, attn_probs_scale = attn_probs * self.qmax, 1. / self.qmax
             v_expanded_float = v_expanded.float()
             # v_expanded_float: [kv_seq_len, Hq, D], v_scale_expanded: [1, Hq, D], attn_probs_scale: const = 1./self.qmax
             outputs[start_loc:end_loc] = (
@@ -1882,7 +1738,4 @@ __all__ = [
     "MojoPagedPrefillSWAWithKVDequant",
     "MojoPagedDecodeSWAWithKVDequant",
     "MojoPagedPrefillSageGQA",
-    "per_channel_int8",
-    "per_token_int8",
-    "per_block_int8",
 ]

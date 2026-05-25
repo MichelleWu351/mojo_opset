@@ -9,7 +9,6 @@ from mojo_opset.experimental import MojoPagedDecodeSWAWithKVDequant
 from mojo_opset.experimental import MojoPagedPrefillGQAWithKVDequant
 from mojo_opset.experimental import MojoPagedPrefillSWAWithKVDequant
 from mojo_opset.experimental import MojoPagedPrefillSageGQA
-from mojo_opset.experimental import per_token_int8, per_channel_int8
 from mojo_opset.tests.utils import auto_switch_platform
 from mojo_opset.tests.utils import bypass_not_implemented
 
@@ -183,6 +182,94 @@ def generate_paged_prefill_quant_data(
     max_total_seq_lens = int(kv_lens.max().item()) if kv_lens.numel() > 0 else 0
     return query, k_cache, v_cache, cu_q_lens, block_tables, cu_total_seq_lens, max_q_lens, max_total_seq_lens
 
+def get_scale_and_quant(
+    x: torch.Tensor,
+    scale: Optional[torch.Tensor],
+    quant_dims,
+    q_max: int = 127,
+    q_min: int = -128,
+    eps: float = 1e-6,
+    quant_dtype: torch.dtype = torch.int8,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert scale is None or isinstance(scale, torch.Tensor), \
+        f"scale must be None or Tensor, got {type(scale)}"
+
+    if scale is None:
+        scale = x.abs().amax(dim=quant_dims, keepdim=True).float() / q_max
+        scale = scale.clamp(min=eps)
+
+    q = torch.clamp(torch.round(x.float() / scale), q_min, q_max).to(quant_dtype)
+    return q, scale
+
+def per_block_int8(
+    x: torch.Tensor,
+    xm: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    *,
+    blk: int = 16,
+    dim1: int = -2,
+    dim2: int = -1,
+    q_max: int = 127,
+    q_min: int = -128,
+):
+    if xm is not None:
+        x = x - xm
+    dim1_norm = dim1 % x.ndim
+    dim2_norm = dim2 % x.ndim
+
+    seq_len = x.shape[dim1_norm]
+    assert seq_len % blk == 0, (
+        f"per_block_int8: dim {dim1_norm} (size {seq_len}) must be divisible by blk={blk}"
+    )
+    num_blocks = seq_len // blk
+
+    # Reshape seq_dim from S into (S // blk, blk) so the inner ``blk`` axis
+    # can be reduced independently.
+    new_shape = (
+        list(x.shape[:dim1_norm])
+        + [num_blocks, blk]
+        + list(x.shape[dim1_norm + 1:])
+    )
+    x_reshaped = x.reshape(new_shape)
+
+    q, scale_kd = get_scale_and_quant(
+        x_reshaped,
+        scale,
+        quant_dims=(dim1_norm, dim2_norm),
+        q_max=q_max,
+        q_min=q_min,
+    )
+
+    q = q.reshape(x.shape)
+    scale_out = scale_kd.squeeze(dim1_norm + 1).repeat_interleave(num_blocks, dim=dim1_norm)
+    return q, scale_out
+
+
+def per_token_int8(
+    x: torch.Tensor,
+    xm: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    *,
+    q_max: int = 127,
+    q_min: int = -128,
+):
+    if xm is not None:
+        x = x - xm
+    return get_scale_and_quant(x, scale, quant_dims=-1, q_max=q_max, q_min=q_min)
+
+
+def per_channel_int8(
+    x: torch.Tensor,
+    xm: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    *,
+    seq_dim: int = 0,
+    q_max: int = 127,
+    q_min: int = -128,
+):
+    if xm is not None:
+        x = x - xm
+    return get_scale_and_quant(x, scale, quant_dims=seq_dim, q_max=q_max, q_min=q_min)
 
 # ===========================================================================
 # MojoPagedPrefillGQAWithKVDequant
