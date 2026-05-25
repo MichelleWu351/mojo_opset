@@ -55,31 +55,22 @@ def cube_qkt_sfa(
     stride_q_t, stride_q_h, stride_q_d,
     stride_wk_slot, stride_wk_kv, stride_wk_d,
     head_dim: tl.constexpr,
-    BLOCK_Q: tl.constexpr,
-    BLOCK_KV: tl.constexpr,
-    BLOCK_D: tl.constexpr,
     offs_q,
     offs_kv,
     q_base,
     wk_base,
     cur_kv,
 ):
-    """Q @ K^T → [BLOCK_Q, BLOCK_KV], D-tiled dot product."""
-    loop_times: tl.constexpr = (head_dim + BLOCK_D - 1) // BLOCK_D
     mask_kv = offs_kv < cur_kv
-    acc = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-    for d in range(loop_times):
-        offs_d = d * BLOCK_D + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < head_dim
-        q = tl.load(
-            Q_ptr + q_base + offs_q[:, None] * stride_q_t + offs_d[None, :] * stride_q_d,
-            mask=mask_d[None, :],
-        ).to(tl.float32)
-        k = tl.load(
-            Wksp_K_ptr + wk_base + offs_kv[:, None] * stride_wk_kv + offs_d[None, :] * stride_wk_d,
-            mask=mask_kv[:, None] & mask_d[None, :],
-        )
-        acc += tl.dot(q, k.trans())
+    offs_d = tl.arange(0, head_dim)
+    q = tl.load(
+        Q_ptr + q_base + offs_q[:, None] * stride_q_t + offs_d[None, :] * stride_q_d,
+    )
+    k = tl.load(
+        Wksp_K_ptr + wk_base + offs_kv[:, None] * stride_wk_kv + offs_d[None, :] * stride_wk_d,
+        mask=mask_kv[:, None],
+    )
+    acc = tl.dot(q, k.trans())
     return acc
 
 
@@ -89,23 +80,19 @@ def cube_pv_sfa(
     Wksp_V_ptr,
     stride_wv_slot, stride_wv_kv, stride_wv_d,
     head_dim: tl.constexpr,
-    BLOCK_Q: tl.constexpr,
-    BLOCK_KV: tl.constexpr,
     offs_kv,
     wv_base,
     cur_kv,
 ):
-    """probs @ V → [BLOCK_Q, head_dim]."""
     mask_kv = offs_kv < cur_kv
     offs_d = tl.arange(0, head_dim)
     v = tl.load(
         Wksp_V_ptr + wv_base + offs_kv[:, None] * stride_wv_kv + offs_d[None, :] * stride_wv_d,
         mask=mask_kv[:, None],
     )
-    return tl.dot(probs, v)
+    p_cast = probs.to(v.dtype)
+    return tl.dot(p_cast, v)
 
-
-# ---- Gather KV from paged cache to workspace ----
 
 @triton.jit
 def _gather_kv_to_wksp(
@@ -127,18 +114,15 @@ def _gather_kv_to_wksp(
     cache_block_size: tl.constexpr,
     cache_layout: tl.constexpr,
     BLOCK_RS2: tl.constexpr,
-    BLOCK_D: tl.constexpr,
     HAS_KSCALES: tl.constexpr,
     HAS_VSCALES: tl.constexpr,
     group, hkv, qid, s_count, total_kv_len,
-    beg_blk, cur_blk, wksp_id,
+    beg_blk, cur_blk, wksp_id, kv_offset,
 ):
-    """Gather sparse KV blocks from paged cache into workspace."""
     offs_sbs = tl.arange(0, sparse_block_size)
-    loop_d_times: tl.constexpr = (head_dim + BLOCK_D - 1) // BLOCK_D
-    wk_base_k = wksp_id * stride_wk_slot
-    wk_base_v = wksp_id * stride_wv_slot
-    wk_base_p = wksp_id * stride_wp_slot
+    wk_base_k = wksp_id * stride_wk_slot + kv_offset * stride_wk_kv
+    wk_base_v = wksp_id * stride_wv_slot + kv_offset * stride_wv_kv
+    wk_base_p = wksp_id * stride_wp_slot + kv_offset * stride_wp_kv
 
     for j in range(BLOCK_RS2):
         blk_idx = beg_blk + j
@@ -163,45 +147,39 @@ def _gather_kv_to_wksp(
                     offs_token, mask=mask_token & valid_pages,
                 )
 
-                for d in range(loop_d_times):
-                    offs_d = d * BLOCK_D + tl.arange(0, BLOCK_D)
-                    mask_d = offs_d < head_dim
-                    if cache_layout == 0:
-                        k_offset = (phys_pages[:, None] * stride_kc_blk + hkv * stride_kc_h
-                                    + page_offsets[:, None] * stride_kc_s + offs_d[None, :] * stride_kc_d)
-                        v_offset = (phys_pages[:, None] * stride_vc_blk + hkv * stride_vc_h
-                                    + page_offsets[:, None] * stride_vc_s + offs_d[None, :] * stride_vc_d)
-                    else:
-                        k_offset = (phys_pages[:, None] * stride_kc_blk + page_offsets[:, None] * stride_kc_s
-                                    + hkv * stride_kc_h + offs_d[None, :] * stride_kc_d)
-                        v_offset = (phys_pages[:, None] * stride_vc_blk + page_offsets[:, None] * stride_vc_s
-                                    + hkv * stride_vc_h + offs_d[None, :] * stride_vc_d)
-                    combined_mask = mask_token[:, None] & valid_pages[:, None] & mask_d[None, :]
-                    k_vals = tl.load(K_cache_ptr + k_offset, mask=combined_mask).to(tl.float32)
-                    v_vals = tl.load(V_cache_ptr + v_offset, mask=combined_mask).to(tl.float32)
-                    if HAS_KSCALES:
-                        k_scale = tl.load(
-                            k_scales_ptr + hkv * stride_ks_h + offs_d[None, :] * stride_ks_d,
-                            mask=mask_d[None, :],
-                        )
-                        k_vals = k_vals * k_scale
-                    if HAS_VSCALES:
-                        v_scale = tl.load(
-                            v_scales_ptr + hkv * stride_vs_h + offs_d[None, :] * stride_vs_d,
-                            mask=mask_d[None, :],
-                        )
-                        v_vals = v_vals * v_scale
-                    tl.store(
-                        Wksp_K_ptr + wk_base_k + ws_offs_token[:, None] * stride_wk_kv
-                        + offs_d[None, :] * stride_wk_d, k_vals, mask=combined_mask,
+                offs_d = tl.arange(0, head_dim)
+                if cache_layout == 0:
+                    k_offset = (phys_pages[:, None] * stride_kc_blk + hkv * stride_kc_h
+                                + page_offsets[:, None] * stride_kc_s + offs_d[None, :] * stride_kc_d)
+                    v_offset = (phys_pages[:, None] * stride_vc_blk + hkv * stride_vc_h
+                                + page_offsets[:, None] * stride_vc_s + offs_d[None, :] * stride_vc_d)
+                else:
+                    k_offset = (phys_pages[:, None] * stride_kc_blk + page_offsets[:, None] * stride_kc_s
+                                + hkv * stride_kc_h + offs_d[None, :] * stride_kc_d)
+                    v_offset = (phys_pages[:, None] * stride_vc_blk + page_offsets[:, None] * stride_vc_s
+                                + hkv * stride_vc_h + offs_d[None, :] * stride_vc_d)
+                combined_mask = mask_token[:, None] & valid_pages[:, None]
+                k_vals = tl.load(K_cache_ptr + k_offset, mask=combined_mask)
+                v_vals = tl.load(V_cache_ptr + v_offset, mask=combined_mask)
+                if HAS_KSCALES:
+                    k_scale = tl.load(
+                        k_scales_ptr + hkv * stride_ks_h + offs_d[None, :] * stride_ks_d,
                     )
-                    tl.store(
-                        Wksp_V_ptr + wk_base_v + ws_offs_token[:, None] * stride_wv_kv
-                        + offs_d[None, :] * stride_wv_d, v_vals, mask=combined_mask,
+                    k_vals = (k_vals.to(tl.float32) * k_scale).to(k_vals.dtype)
+                if HAS_VSCALES:
+                    v_scale = tl.load(
+                        v_scales_ptr + hkv * stride_vs_h + offs_d[None, :] * stride_vs_d,
                     )
+                    v_vals = (v_vals.to(tl.float32) * v_scale).to(v_vals.dtype)
+                tl.store(
+                    Wksp_K_ptr + wk_base_k + ws_offs_token[:, None] * stride_wk_kv
+                    + offs_d[None, :] * stride_wk_d, k_vals, mask=combined_mask,
+                )
+                tl.store(
+                    Wksp_V_ptr + wk_base_v + ws_offs_token[:, None] * stride_wv_kv
+                    + offs_d[None, :] * stride_wv_d, v_vals, mask=combined_mask,
+                )
 
-
-# ---- Main kernel — per query-head parallelization ----
 
 @triton.jit(do_not_specialize=[
     "T", "G", "cumsum_q_len_len", "tasks_per_prog",
@@ -236,21 +214,16 @@ def _sals_sfa_fwd_kernel(
     HAS_USEDENSE: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_RS2: tl.constexpr,
-    BLOCK_D: tl.constexpr,
 ):
-    """SALS SFA Forward — per (group, query_head) parallelization.
-    Grid: (prog_num,), each program handles tasks_per_prog (group, hq) pairs.
-    Per pair: gather KV for the corresponding kv_head, compute attention.
-    """
     pid = tl.program_id(0)
+    num_kv_heads: tl.constexpr = num_query_heads // g_ratio
     BLOCK_KV: tl.constexpr = BLOCK_RS2 * sparse_block_size
 
     for task_sub in range(tasks_per_prog):
         task = pid * tasks_per_prog + task_sub
-        if task < G * num_query_heads:
-            group = task // num_query_heads
-            hq = task % num_query_heads
-            hkv = hq // g_ratio
+        if task < G * num_kv_heads:
+            group = task // num_kv_heads
+            hkv = task % num_kv_heads
             qid = tl.load(group_qid_ptr + group).to(tl.int32)
             q_start = tl.load(group_q_start_ptr + group).to(tl.int32)
             q_len = tl.load(group_q_len_ptr + group).to(tl.int32)
@@ -276,116 +249,127 @@ def _sals_sfa_fwd_kernel(
 
             if should_process:
                 num_q_tiles = tl.cdiv(actual_q_len, BLOCK_Q)
-                q_base = q_start * stride_q_t + hq * stride_q_h
-                o_base = q_start * stride_o_t + hq * stride_o_h
-                wksp_id = pid
-                wk_base_k = wksp_id * stride_wk_slot
-                wk_base_v = wksp_id * stride_wv_slot
-                wk_base_p = wksp_id * stride_wp_slot
                 num_blk_batches = tl.cdiv(s_count, BLOCK_RS2)
+                wksp_id = pid
                 offs_kv = tl.arange(0, BLOCK_KV)
 
-                for q_tile in range(num_q_tiles):
-                    q_offs = q_tile * BLOCK_Q + tl.arange(0, BLOCK_Q)
-                    mask_q = q_offs < actual_q_len
-                    causal_thresh = (base_kv + start_in_req + q_offs).to(tl.int32)
-                    m_i = tl.zeros([BLOCK_Q], dtype=tl.float32) + float('-inf')
-                    l_i = tl.zeros([BLOCK_Q], dtype=tl.float32)
-                    o_i = tl.zeros([BLOCK_Q, head_dim], dtype=tl.float32)
-
-                    for blk_batch in range(num_blk_batches):
-                        beg_blk = blk_batch * BLOCK_RS2
-                        cur_blk = s_count - beg_blk
-                        if cur_blk > BLOCK_RS2:
-                            cur_blk = BLOCK_RS2
-                        cur_kv = cur_blk * sparse_block_size
-
-                        _gather_kv_to_wksp(
-                            Wksp_K_ptr, Wksp_V_ptr,
-                            Wksp_pos_ptr,
-                            K_cache_ptr, V_cache_ptr,
-                            k_scales_ptr, v_scales_ptr,
-                            block_tables_ptr,
-                            indices_flat_ptr,
-                            stride_wk_slot,
-                            stride_wk_kv,
-                            stride_wk_d,
-                            stride_wv_slot,
-                            stride_wv_kv,
-                            stride_wv_d,
-                            stride_wp_slot,
-                            stride_wp_kv,
-                            stride_kc_blk,
-                            stride_kc_h,
-                            stride_kc_s,
-                            stride_kc_d,
-                            stride_vc_blk,
-                            stride_vc_h,
-                            stride_vc_s,
-                            stride_vc_d,
-                            stride_ks_h,
-                            stride_ks_d,
-                            stride_vs_h,
-                            stride_vs_d,
-                            stride_bt_req,
-                            stride_bt_blk,
-                            stride_idx_g,
-                            stride_idx_h,
-                            stride_idx_k,
-                            head_dim,
-                            sparse_block_size,
-                            cache_block_size,
-                            cache_layout,
-                            BLOCK_RS2, BLOCK_D,
-                            HAS_KSCALES,
-                            HAS_VSCALES,
-                            group, hkv, qid,
-                            s_count, total_kv_len,
-                            beg_blk, cur_blk,
-                            wksp_id,
-                        )
-
-                        token_pos = tl.load(
-                            Wksp_pos_ptr + wk_base_p + offs_kv * stride_wp_kv,
-                            mask=offs_kv < cur_kv, other=-1,
-                        )
-                        valid_kv = (offs_kv[None, :] < cur_kv) & (token_pos[None, :] >= 0) & (token_pos[None, :] < total_kv_len)
-                        scores = cube_qkt_sfa(
-                            Q_ptr, Wksp_K_ptr,
-                            stride_q_t, stride_q_h, stride_q_d,
-                            stride_wk_slot, stride_wk_kv, stride_wk_d,
-                            head_dim, BLOCK_Q, BLOCK_KV, BLOCK_D,
-                            q_offs, offs_kv, q_base, wk_base_k, cur_kv,
-                        )
-                        scores = scores * softmax_scale
-                        causal_mask = token_pos[None, :] > causal_thresh[:, None]
-                        scores = tl.where(valid_kv, scores, float('-inf'))
-                        scores = tl.where(mask_q[:, None], scores, float('-inf'))
-                        scores = tl.where(causal_mask, float('-inf'), scores)
-                        row_max_j = tl.max(scores, axis=1)
-                        m_new = tl.maximum(m_i, row_max_j)
-                        alpha = tl.where(m_i > float('-inf'), tl.exp(m_i - m_new), 0.0)
-                        p = tl.exp(scores - m_new[:, None])
-                        p = tl.where(scores > float('-inf'), p, 0.0)
-                        l_i = alpha * l_i + tl.sum(p, axis=1)
-                        pv = cube_pv_sfa(
-                            p, Wksp_V_ptr,
-                            stride_wv_slot, stride_wv_kv, stride_wv_d,
-                            head_dim, BLOCK_Q, BLOCK_KV,
-                            offs_kv, wk_base_v, cur_kv,
-                        )
-                        o_i = alpha[:, None] * o_i + pv
-                        m_i = m_new
-
-                    safe_l = tl.where(l_i == 0.0, 1.0, l_i)
-                    out = o_i / safe_l[:, None]
-                    offs_d_full = tl.arange(0, head_dim)
-                    out_vals = out.to(output_ptr.dtype.element_ty)
-                    tl.store(
-                        output_ptr + o_base + q_offs[:, None] * stride_o_t
-                        + offs_d_full[None, :] * stride_o_d,
-                        out_vals, mask=mask_q[:, None],
+                for blk_batch in range(num_blk_batches):
+                    beg_blk = blk_batch * BLOCK_RS2
+                    cur_blk = s_count - beg_blk
+                    if cur_blk > BLOCK_RS2:
+                        cur_blk = BLOCK_RS2
+                    kv_offset = beg_blk * sparse_block_size
+                    _gather_kv_to_wksp(
+                        Wksp_K_ptr, Wksp_V_ptr,
+                        Wksp_pos_ptr,
+                        K_cache_ptr, V_cache_ptr,
+                        k_scales_ptr, v_scales_ptr,
+                        block_tables_ptr,
+                        indices_flat_ptr,
+                        stride_wk_slot,
+                        stride_wk_kv,
+                        stride_wk_d,
+                        stride_wv_slot,
+                        stride_wv_kv,
+                        stride_wv_d,
+                        stride_wp_slot,
+                        stride_wp_kv,
+                        stride_kc_blk,
+                        stride_kc_h,
+                        stride_kc_s,
+                        stride_kc_d,
+                        stride_vc_blk,
+                        stride_vc_h,
+                        stride_vc_s,
+                        stride_vc_d,
+                        stride_ks_h,
+                        stride_ks_d,
+                        stride_vs_h,
+                        stride_vs_d,
+                        stride_bt_req,
+                        stride_bt_blk,
+                        stride_idx_g,
+                        stride_idx_h,
+                        stride_idx_k,
+                        head_dim,
+                        sparse_block_size,
+                        cache_block_size,
+                        cache_layout,
+                        BLOCK_RS2,
+                        HAS_KSCALES,
+                        HAS_VSCALES,
+                        group, hkv, qid,
+                        s_count, total_kv_len,
+                        beg_blk, cur_blk,
+                        wksp_id, kv_offset,
                     )
+
+                for hq_offset in range(g_ratio):
+                    hq = hkv * g_ratio + hq_offset
+                    q_base = q_start * stride_q_t + hq * stride_q_h
+                    o_base = q_start * stride_o_t + hq * stride_o_h
+
+                    for q_tile in range(num_q_tiles):
+                        q_offs = q_tile * BLOCK_Q + tl.arange(0, BLOCK_Q)
+                        mask_q = q_offs < actual_q_len
+                        causal_thresh = (base_kv + start_in_req + q_offs).to(tl.int32)
+                        m_i = tl.zeros([BLOCK_Q], dtype=tl.float32) + float('-inf')
+                        l_i = tl.zeros([BLOCK_Q], dtype=tl.float32)
+                        o_i = tl.zeros([BLOCK_Q, head_dim], dtype=tl.float32)
+
+                        for blk_batch in range(num_blk_batches):
+                            beg_blk = blk_batch * BLOCK_RS2
+                            cur_blk = s_count - beg_blk
+                            if cur_blk > BLOCK_RS2:
+                                cur_blk = BLOCK_RS2
+                            cur_kv = cur_blk * sparse_block_size
+                            kv_offset = beg_blk * sparse_block_size
+
+                            wk_base_k = wksp_id * stride_wk_slot + kv_offset * stride_wk_kv
+                            wk_base_v = wksp_id * stride_wv_slot + kv_offset * stride_wv_kv
+                            wk_base_p = wksp_id * stride_wp_slot + kv_offset * stride_wp_kv
+
+                            valid_kv = offs_kv[None, :] < cur_kv
+                            token_pos = tl.load(
+                                Wksp_pos_ptr + wk_base_p + offs_kv * stride_wp_kv,
+                                mask=offs_kv < cur_kv, other=-1,
+                            )
+                            scores = cube_qkt_sfa(
+                                Q_ptr, Wksp_K_ptr,
+                                stride_q_t, stride_q_h, stride_q_d,
+                                stride_wk_slot, stride_wk_kv, stride_wk_d,
+                                head_dim,
+                                q_offs, offs_kv, q_base, wk_base_k, cur_kv,
+                            )
+                            scores = scores * softmax_scale
+                            causal_mask = token_pos[None, :] > causal_thresh[:, None]
+                            scores = tl.where(valid_kv, scores, float('-inf'))
+                            scores = tl.where(mask_q[:, None], scores, float('-inf'))
+                            scores = tl.where(causal_mask, float('-inf'), scores)
+                            row_max_j = tl.max(scores, axis=1)
+                            m_new = tl.maximum(m_i, row_max_j, propagate_nan=tl.PropagateNan.ALL)
+                            alpha = tl.where(m_i > float('-inf'), tl.exp(m_i - m_new), 0.0)
+                            p = tl.exp(scores - m_new[:, None])
+                            p = tl.where(scores > float('-inf'), p, 0.0)
+                            l_i = alpha * l_i + tl.sum(p, axis=1)
+                            pv = cube_pv_sfa(
+                                p, Wksp_V_ptr,
+                                stride_wv_slot, stride_wv_kv, stride_wv_d,
+                                head_dim,
+                                offs_kv, wk_base_v, cur_kv,
+                            )
+                            o_i = alpha[:, None] * o_i + pv
+                            m_i = m_new
+
+                        safe_l = tl.where(l_i == 0.0, 1.0, l_i)
+                        out = o_i / safe_l[:, None]
+                        offs_d_full = tl.arange(0, head_dim)
+                        out_vals = out.to(output_ptr.dtype.element_ty)
+                        tl.store(
+                            output_ptr + o_base + q_offs[:, None] * stride_o_t
+                            + offs_d_full[None, :] * stride_o_d,
+                            out_vals, mask=mask_q[:, None],
+                        )
 
 
 def sals_sfa_impl(
@@ -428,27 +412,27 @@ def sals_sfa_impl(
         cache_block_size = k_cache.shape[1]
 
     g_ratio = num_query_heads // num_kv_heads
-    BLOCK_Q = 16
-    # Keep BLOCK_KV small enough for 910B2C local buffers. 64-token sparse
-    # blocks overflow cbuf/ub with BLOCK_RS2=8, so shrink the block batch.
+    BLOCK_Q = 32
     if sparse_block_size >= 128:
         BLOCK_RS2 = 2
     elif sparse_block_size >= 64:
         BLOCK_RS2 = 4
     else:
         BLOCK_RS2 = 8
-    BLOCK_D = head_dim
-    BLOCK_KV = BLOCK_RS2 * sparse_block_size
 
-    total_tasks = G * num_query_heads
+    total_tasks = G * num_kv_heads
     core_num = get_num_cores("cube")
     prog_num = min(total_tasks, core_num)
     tasks_per_prog = triton.cdiv(total_tasks, prog_num)
 
+    max_s_count = int(seq_len_flat.max().item()) if G > 0 else 0
+    max_kv_tokens = max(max_s_count * sparse_block_size, 1)
+
+    wk_dtype = q.dtype
     wksp_count = prog_num
-    workspace_k = torch.empty((wksp_count, BLOCK_KV, head_dim), dtype=torch.float32, device=device)
-    workspace_v = torch.empty((wksp_count, BLOCK_KV, head_dim), dtype=torch.float32, device=device)
-    workspace_pos = torch.full((wksp_count, BLOCK_KV), -1, dtype=torch.int64, device=device)
+    workspace_k = torch.empty((wksp_count, max_kv_tokens, head_dim), dtype=wk_dtype, device=device)
+    workspace_v = torch.empty((wksp_count, max_kv_tokens, head_dim), dtype=wk_dtype, device=device)
+    workspace_pos = torch.full((wksp_count, max_kv_tokens), -1,dtype=torch.int32, device=device)
 
     if k_scales is None:
         k_scales = torch.empty(0, dtype=torch.float32, device=device)
@@ -509,8 +493,8 @@ def sals_sfa_impl(
         cache_layout=cache_layout,
         HAS_KSCALES=k_scales.numel() > 0, HAS_VSCALES=v_scales.numel() > 0,
         HAS_USEDENSE=group_use_dense.numel() > 0,
-        BLOCK_Q=BLOCK_Q, BLOCK_RS2=BLOCK_RS2, BLOCK_D=BLOCK_D,
+        BLOCK_Q=BLOCK_Q, BLOCK_RS2=BLOCK_RS2,
         multibuffer=True,
-        limit_auto_multi_buffer_of_local_buffer="no-limit",
+        enable_ubuf_saving=True,
     )
     return output
