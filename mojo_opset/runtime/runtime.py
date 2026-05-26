@@ -312,7 +312,7 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
         seq_used_q,
         shared_metadata,
         win_slot_mapping,
-        kv_slot_mapping,
+        full_kv_cache,
         is_prefill,
         batch_size,
         decode_fast_path=False,
@@ -326,12 +326,10 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
         win_kv_cache, win_block_table = pkv.get_win_kv_for_decode(0)
         block_table["win_kv"] = win_block_table
         slot_mapping["win_kv"] = win_slot_mapping
-        if kv_slot_mapping is not None:
-            slot_mapping["kv"] = kv_slot_mapping
 
         if is_prefill:
             block_table["full_kv"] = pkv.get_full_block_table(batch_size)
-            slot_mapping["full_kv"] = pkv.get_win_slot_mapping(context_lens, q_lens, pad_to_window=False)
+            slot_mapping["full_kv"] = pkv.get_full_slot_mapping(context_lens, q_lens)
             slot_mapping["full_kv_gather_indices"] = pkv.get_full_kv_gather_indices(context_lens, q_lens)
 
         for ratio, metadata in shared_metadata.items():
@@ -392,6 +390,7 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
             "kernel_metadata": kernel_metadata,
             "is_prefill": is_prefill,
             "win_kv_cache": win_kv_cache,
+            "full_kv_cache": full_kv_cache,
         }
 
     @classmethod
@@ -477,6 +476,7 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
                     "cmp_rope_position_ids": cmp_rope_position_ids,
                 })
 
+        full_kv_cache = pkv.init_full_buffer_c1a()
         win_slot_mapping = pkv.get_win_slot_mapping(context_lens, q_lens, pad_to_window=True)
         attn_metadata = self._build_golden_style_attn_metadata(
             position_ids=position_ids,
@@ -488,7 +488,7 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
             seq_used_q=seq_used_q,
             shared_metadata=shared_metadata,
             win_slot_mapping=win_slot_mapping,
-            kv_slot_mapping=None,
+            full_kv_cache=full_kv_cache,
             is_prefill=True,
             batch_size=batch_size,
             decode_fast_path=False,
@@ -502,6 +502,7 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
                 attn_inputs[layer_idx] = self._prepare_layer_prefill_inputs(
                     layer_idx, ratio, context_lens, q_lens, cu_q_lens,
                     start_pos, seq_used_q, batch_size, seq_len, device,
+                    full_kv_cache,
                     shared_metadata.get(ratio, {}),
                 )
 
@@ -519,7 +520,7 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
     def _prepare_layer_prefill_inputs(
         self, layer_idx, ratio, context_lens, q_lens, cu_q_lens,
         start_pos, seq_used_q, batch_size, seq_len, device,
-        shared_metadata=None,
+        full_kv_cache, shared_metadata=None,
     ):
         pkv = self.paged_cache
         layer_inputs = {
@@ -528,6 +529,10 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
             "start_pos": start_pos,
             "seq_used_q": seq_used_q,
             "sas_metadata": shared_metadata.get("sas_metadata") if shared_metadata else None,
+            "full_kv_cache": full_kv_cache,
+            "full_block_table": pkv.get_full_block_table(batch_size),
+            "full_slot_mapping": pkv.get_full_slot_mapping(context_lens, q_lens),
+            "full_kv_gather_indices": pkv.get_full_kv_gather_indices(context_lens, q_lens),
         }
         if ratio <= 1:
             return layer_inputs
@@ -609,10 +614,8 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
         seq_used_q = q_lens
         if decode_fast_path:
             win_slot_mapping = pkv.get_win_slot_mapping_decode(start_pos)
-            kv_slot_mapping = pkv.get_all_kv_slot_mapping_decode(start_pos)
         else:
             win_slot_mapping = pkv.get_win_slot_mapping(context_lens, q_lens)
-            kv_slot_mapping = pkv.get_all_kv_slot_mapping(start_pos, seq_used_q, seq_len)
 
         unique_ratios = sorted(set(
             self.config.compress_ratios[l] if l < len(self.config.compress_ratios) else 0
@@ -653,7 +656,7 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
             seq_used_q=seq_used_q,
             shared_metadata=shared_metadata,
             win_slot_mapping=win_slot_mapping,
-            kv_slot_mapping=kv_slot_mapping,
+            full_kv_cache=None,
             is_prefill=False,
             batch_size=batch_size,
             decode_fast_path=decode_fast_path,
@@ -691,17 +694,12 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
         shared_metadata=None, win_slot_mapping=None,
     ):
         pkv = self.paged_cache
-        kv_cache, block_tables = pkv.get_kv_for_decode(layer_idx)
         win_kv_cache, win_block_table = pkv.get_win_kv_for_decode(layer_idx)
-        kv_slot_mapping = self._compute_kv_slot_mapping(layer_idx, context_lens, seq_len)
 
         layer_inputs = {
-            "kv_cache": kv_cache,
-            "block_tables": block_tables,
             "win_kv_cache": win_kv_cache,
             "win_block_table": win_block_table,
             "win_slot_mapping": win_slot_mapping,
-            "kv_slot_mapping": kv_slot_mapping,
             "q_lens": q_lens,
             "cu_q_lens": cu_q_lens,
             "start_pos": start_pos,
@@ -759,24 +757,6 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
             "li_metadata": li_metadata,
         })
         return layer_inputs
-
-    def _compute_kv_slot_mapping(self, layer_idx, context_lens, seq_len):
-        pkv = self.paged_cache
-        batch_size = context_lens.shape[0]
-        device = context_lens.device
-        positions = context_lens.to(torch.int32).unsqueeze(1) + torch.arange(
-            seq_len, dtype=torch.int32, device=device,
-        ).unsqueeze(0)
-        block_idx = positions // pkv.block_size
-        offset = positions % pkv.block_size
-        batch_indices = torch.arange(batch_size, dtype=torch.long, device=device).unsqueeze(1).expand(-1, seq_len)
-        max_blocks = pkv.block_tables.shape[2]
-        block_idx_clamped = block_idx.clamp(max=max_blocks - 1).to(torch.long)
-        phys_blocks = pkv.block_tables[layer_idx, batch_indices, block_idx_clamped]
-        slot_mapping = phys_blocks * pkv.block_size + offset
-        valid_mask = block_idx < max_blocks
-        slot_mapping = torch.where(valid_mask, slot_mapping, torch.full_like(slot_mapping, -1))
-        return slot_mapping.reshape(-1).to(torch.int32)
 
     def _compute_li_metadata(self, actual_seq_q, actual_seq_k, block_table):
         config = self.config

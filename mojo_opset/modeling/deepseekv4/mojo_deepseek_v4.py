@@ -312,35 +312,13 @@ class PagedDummyCache:
         self._win_block_table = self._calc_ring_block_table(self.win_cache_size, self.batch_size)
         self._full_block_table = self._calc_full_block_table(self.max_seq_len, self.batch_size)
 
-        max_blocks_per_seq = (max_seq_len + self.block_size - 1) // self.block_size
-        self.max_blocks_per_seq = max_blocks_per_seq
-        total_blocks = self.batch_size * max_blocks_per_seq * self.num_layers
         self._decode_q_lens = torch.ones((self.batch_size,), dtype=torch.int32, device=self.device)
         self._decode_cu_q_lens = torch.arange(self.batch_size + 1, dtype=torch.int32, device=self.device)
         self._decode_position_offsets = torch.zeros((1, 1), dtype=torch.long, device=self.device)
         self._batch_indices_long = torch.arange(self.batch_size, dtype=torch.long, device=self.device)
-        self._batch_block_base = (
-            torch.arange(self.batch_size, dtype=torch.int32, device=self.device)
-            .view(1, self.batch_size, 1) * max_blocks_per_seq
-        )
-        self._layer_block_base = (
-            torch.arange(self.num_layers, dtype=torch.int32, device=self.device)
-            .view(self.num_layers, 1, 1) * self.batch_size * max_blocks_per_seq
-        )
-
-        self.kv_cache = torch.zeros(
-            (total_blocks, self.block_size, 1, self.head_dim),
-            dtype=torch.bfloat16, device=self.device,
-        )
-        self.block_tables = torch.full(
-            (self.num_layers, self.batch_size, max_blocks_per_seq),
-            -1, dtype=torch.int32, device=self.device,
-        )
         self.seq_lens = torch.zeros(
             (self.num_layers, self.batch_size), dtype=torch.int32, device=self.device,
         )
-        self.free_blocks = torch.arange(total_blocks, device=self.device, dtype=torch.int32)
-        self.num_free_blocks = total_blocks
         self.scatter_nd_update = MojoScatterNdUpdateAsc()
         self.li_dynamic_quant = MojoDynamicQuant()
 
@@ -665,6 +643,30 @@ class PagedDummyCache:
         token_indices = torch.arange(self.sliding_window, dtype=torch.int32, device=self.device)
         return gather_start.unsqueeze(1) + token_indices.unsqueeze(0)
 
+    def init_full_buffer_c1a(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        return self._create_cache(self._get_block_num(self.max_seq_len), self.head_dim, dtype)
+
+    def get_full_slot_mapping(
+        self,
+        start_pos: torch.Tensor,
+        seq_used_q: torch.Tensor,
+    ) -> torch.Tensor:
+        start_pos = start_pos.to(device=self.device, dtype=torch.int32)
+        seq_used_q = seq_used_q.to(device=self.device, dtype=torch.int32)
+        batch_size = start_pos.shape[0]
+        seq_len = int(seq_used_q.max().item()) if batch_size > 0 else 0
+        if seq_len == 0:
+            return torch.empty((0,), dtype=torch.int32, device=self.device)
+        block_table = self._get_full_block_table(batch_size)
+        offsets_in_seq = torch.arange(seq_len, dtype=torch.int32, device=self.device).unsqueeze(0)
+        valid_mask = offsets_in_seq < seq_used_q.unsqueeze(1)
+        positions = start_pos.unsqueeze(1) + offsets_in_seq
+        block_idx = (positions // self.block_size).to(torch.long)
+        block_offset = positions % self.block_size
+        row_idx = torch.arange(batch_size, device=self.device, dtype=torch.long).unsqueeze(1).expand_as(block_idx)
+        slots = block_table[row_idx, block_idx] * self.block_size + block_offset
+        return slots[valid_mask].to(dtype=torch.int32)
+
     def build_full_kv_for_prefill(
         self,
         kv: torch.Tensor,
@@ -673,30 +675,21 @@ class PagedDummyCache:
         actual_q_lens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = kv.shape[0]
-        seq_len = kv.shape[1]
-        full_kv = self._create_cache(self._get_block_num(self.max_seq_len), self.head_dim, kv.dtype)
-        block_table = self._get_full_block_table(batch_size)
         q_lens = (cu_q_lens[1:] - cu_q_lens[:-1]).to(device=kv.device, dtype=torch.int32)
         if actual_q_lens is not None:
             q_lens = actual_q_lens.to(device=kv.device, dtype=torch.int32)
-        token_offsets = torch.arange(seq_len, dtype=torch.int32, device=kv.device).unsqueeze(0)
-        valid_mask = token_offsets < q_lens.unsqueeze(1)
-        positions = context_lens.to(device=kv.device, dtype=torch.int32).unsqueeze(1) + token_offsets
-        block_idx = (positions // self.block_size).to(torch.long)
-        valid_mask = valid_mask & (block_idx < block_table.shape[1])
-
-        if bool(valid_mask.any().item()):
-            row_idx = torch.arange(batch_size, device=kv.device, dtype=torch.long).unsqueeze(1).expand_as(block_idx)
-            offset = positions % self.block_size
-            slot_mapping = (block_table[row_idx, block_idx.clamp(max=block_table.shape[1] - 1)] * self.block_size + offset)
+        full_kv = self.init_full_buffer_c1a(dtype=kv.dtype)
+        slot_mapping = self.get_full_slot_mapping(context_lens, q_lens)
+        if slot_mapping.numel() > 0:
+            token_offsets = torch.arange(kv.shape[1], dtype=torch.int32, device=kv.device).unsqueeze(0)
+            valid_mask = token_offsets < q_lens.unsqueeze(1)
             kv_flat = kv[valid_mask].reshape(-1, self.head_dim)
-            slot_mapping = slot_mapping[valid_mask].to(dtype=torch.int32)
             self.scatter_nd_update(
                 full_kv.view(-1, self.head_dim),
                 slot_mapping.reshape(-1, 1),
                 kv_flat,
             )
-        return full_kv, block_table
+        return full_kv, self._get_full_block_table(batch_size)
 
     def _create_state_cache(self, state_block_num, compress_ratio, cache_dim):
         overlap_num = 2 if compress_ratio == 4 else 1
@@ -706,11 +699,7 @@ class PagedDummyCache:
         )
 
     def _allocate_blocks(self, num_blocks: int) -> torch.Tensor:
-        if num_blocks > self.num_free_blocks:
-            raise ValueError(f"PagedDummyCache: Out of memory!")
-        allocated = self.free_blocks[self.num_free_blocks - num_blocks: self.num_free_blocks]
-        self.num_free_blocks -= num_blocks
-        return allocated
+        raise RuntimeError("PagedDummyCache no longer keeps persistent full original KV blocks.")
 
     def update(self, kv: torch.Tensor, layer_idx: int, cu_q_lens: Optional[torch.Tensor] = None,
                actual_q_lens: Optional[torch.Tensor] = None) -> None:
@@ -723,44 +712,10 @@ class PagedDummyCache:
                 device=kv.device, dtype=torch.int32,
             )
 
-        current_seq_lens = self.seq_lens[layer_idx]
         q_lens = (cu_q_lens[1:] - cu_q_lens[:-1]).to(device=kv.device, dtype=torch.int32)
         if actual_q_lens is not None:
             q_lens = actual_q_lens.to(device=kv.device, dtype=torch.int32)
-        new_total_lens = current_seq_lens + q_lens
-
-        max_blocks_per_seq = self.block_tables.shape[2]
-        logical_blocks = torch.arange(max_blocks_per_seq, dtype=torch.int32, device=kv.device).unsqueeze(0)
-        required_blocks = (new_total_lens + self.block_size - 1) // self.block_size
-        required_mask = logical_blocks < required_blocks.unsqueeze(1)
-
-        # Use a deterministic physical block layout, equivalent to golden's static PA table.
-        layer_base = layer_idx * batch_size * max_blocks_per_seq
-        batch_base = torch.arange(batch_size, dtype=torch.int32, device=kv.device).unsqueeze(1) * max_blocks_per_seq
-        deterministic_blocks = layer_base + batch_base + logical_blocks
-        self.block_tables[layer_idx] = torch.where(
-            required_mask,
-            deterministic_blocks,
-            self.block_tables[layer_idx],
-        )
-
-        token_offsets = torch.arange(new_seq_len, dtype=torch.int32, device=kv.device).unsqueeze(0)
-        valid_mask = token_offsets < q_lens.unsqueeze(1)
-        positions = current_seq_lens.unsqueeze(1) + token_offsets
-        block_idx = (positions // self.block_size).to(torch.long)
-        valid_mask = valid_mask & (block_idx < max_blocks_per_seq)
-
-        row_idx = torch.arange(batch_size, device=kv.device, dtype=torch.long).unsqueeze(1).expand_as(block_idx)
-        block_idx_safe = block_idx.clamp(max=max_blocks_per_seq - 1)
-        phys_block = self.block_tables[layer_idx][row_idx, block_idx_safe]
-        slot_mapping = (phys_block * self.block_size + (positions % self.block_size)).to(dtype=torch.int32)
-        kv_flat = kv[valid_mask].reshape(-1, self.head_dim)
-        slot_mapping = slot_mapping[valid_mask]
-        cache_flat = self.kv_cache.view(-1, self.head_dim)
-        self.scatter_nd_update(
-            cache_flat, slot_mapping.reshape(-1, 1), kv_flat
-        )
-        self.seq_lens[layer_idx] = new_total_lens.to(self.seq_lens.dtype)
+        self.seq_lens[layer_idx] = (self.seq_lens[layer_idx] + q_lens).to(self.seq_lens.dtype)
 
     def update_win_kv(
         self,
@@ -848,8 +803,8 @@ class PagedDummyCache:
                     li_cmp_cache[block_idx, offset, 0, :] = kv_quant[t]
                     scale_cache[block_idx, offset, 0, 0] = k_scale[t]
 
-    def get_kv_for_decode(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.kv_cache, self.block_tables[layer_idx]
+    def get_kv_for_decode(self, layer_idx: int) -> Tuple[None, None]:
+        return None, None
 
     def get_kv_slot_mapping(
         self,
@@ -857,51 +812,19 @@ class PagedDummyCache:
         start_pos: torch.Tensor,
         seq_used_q: torch.Tensor,
         seq_len: int,
-    ) -> torch.Tensor:
-        return self.get_all_kv_slot_mapping(start_pos, seq_used_q, seq_len)[layer_idx]
+    ) -> Optional[torch.Tensor]:
+        return None
 
     def get_all_kv_slot_mapping(
         self,
         start_pos: torch.Tensor,
         seq_used_q: torch.Tensor,
         seq_len: int,
-    ) -> torch.Tensor:
-        batch_size = start_pos.shape[0]
-        if batch_size == 0 or seq_len == 0:
-            return torch.empty((self.num_layers, 0), dtype=torch.int32, device=start_pos.device)
-        positions = start_pos.to(torch.int32).unsqueeze(1) + torch.arange(
-            seq_len, dtype=torch.int32, device=start_pos.device,
-        ).unsqueeze(0)
-        block_idx = positions // self.block_size
-        offset = positions % self.block_size
-        max_blocks = self.block_tables.shape[2]
-        valid_mask = (
-            (block_idx < max_blocks)
-            & (torch.arange(seq_len, dtype=torch.int32, device=start_pos.device).unsqueeze(0) < seq_used_q.to(torch.int32).unsqueeze(1))
-        )
-        batch_indices = torch.arange(batch_size, dtype=torch.long, device=start_pos.device).view(1, batch_size, 1)
-        block_idx_clamped = block_idx.clamp(max=max_blocks - 1).to(torch.long).unsqueeze(0)
-        phys_blocks = self.block_tables[:, batch_indices, block_idx_clamped].squeeze(1)
-        slot_mapping = phys_blocks * self.block_size + offset.unsqueeze(0)
-        slot_mapping = torch.where(valid_mask.unsqueeze(0), slot_mapping, torch.full_like(slot_mapping, -1))
-        return slot_mapping.reshape(self.num_layers, -1).to(torch.int32)
+    ) -> Optional[torch.Tensor]:
+        return None
 
-    def get_all_kv_slot_mapping_decode(self, start_pos: torch.Tensor) -> torch.Tensor:
-        batch_size = start_pos.shape[0]
-        if batch_size == 0:
-            return torch.empty((self.num_layers, 0), dtype=torch.int32, device=start_pos.device)
-        start_pos = start_pos.to(dtype=torch.int32)
-        block_idx = (start_pos // self.block_size).view(1, batch_size, 1)
-        offset = (start_pos % self.block_size).view(1, batch_size, 1)
-        phys_blocks = (
-            self._layer_block_base[:, :batch_size, :]
-            + self._batch_block_base[:, :batch_size, :]
-            + block_idx
-        )
-        slot_mapping = phys_blocks * self.block_size + offset
-        valid_mask = block_idx < self.max_blocks_per_seq
-        slot_mapping = torch.where(valid_mask, slot_mapping, torch.full_like(slot_mapping, -1))
-        return slot_mapping.reshape(self.num_layers, -1).to(torch.int32)
+    def get_all_kv_slot_mapping_decode(self, start_pos: torch.Tensor) -> Optional[torch.Tensor]:
+        return None
 
     def get_win_kv_for_decode(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         win_kv = self.cache_data[layer_idx]["win_kv"]
@@ -1569,30 +1492,19 @@ class DeepseekV4Attention(nn.Module):
         })
 
         if past_key_values is not None:
-            kv_cache, decode_block_tables = past_key_values.get_kv_for_decode(self.layer_idx)
             win_kv_cache, fallback_win_block_table = past_key_values.get_win_kv_for_decode(self.layer_idx)
             win_block_table = prefer_metadata(block_table.get("win_kv"), "win_block_table")
             if win_block_table is None:
                 win_block_table = fallback_win_block_table
             layer_inputs.update({
-                "kv_cache": kv_cache,
-                "block_tables": decode_block_tables,
                 "win_kv_cache": win_kv_cache,
                 "win_block_table": win_block_table,
                 "win_slot_mapping": prefer_metadata(slot_mapping.get("win_kv"), "win_slot_mapping"),
+                "full_kv_cache": prefer_metadata(attn_metadata.get("full_kv_cache"), "full_kv_cache"),
+                "full_block_table": prefer_metadata(block_table.get("full_kv"), "full_block_table"),
+                "full_slot_mapping": prefer_metadata(slot_mapping.get("full_kv"), "full_slot_mapping"),
+                "full_kv_gather_indices": prefer_metadata(slot_mapping.get("full_kv_gather_indices"), "full_kv_gather_indices"),
             })
-            kv_slot_mapping = prefer_metadata(slot_mapping.get("kv"), "kv_slot_mapping")
-            if kv_slot_mapping is not None and kv_slot_mapping.dim() > 1:
-                kv_slot_mapping = kv_slot_mapping[self.layer_idx]
-            if kv_slot_mapping is None and not attn_metadata.get("is_prefill", False):
-                kv_slot_mapping = past_key_values.get_kv_slot_mapping(
-                    self.layer_idx,
-                    attn_metadata["start_pos"],
-                    attn_metadata["seq_used_q"],
-                    attn_metadata["position_ids"].shape[-1],
-                )
-            if kv_slot_mapping is not None:
-                layer_inputs["kv_slot_mapping"] = kv_slot_mapping
 
         if self.compress_ratio <= 1:
             return layer_inputs
@@ -1947,6 +1859,43 @@ class DeepseekV4Attention(nn.Module):
             o = self._attn_post(o, position_embeddings)
         return o, None
 
+    def _prepare_prefill_ori_kv(
+        self,
+        kv: torch.Tensor,
+        past_key_values: PagedDummyCache,
+        context_lens: torch.Tensor,
+        q_lens: torch.Tensor,
+        attn_inputs: dict,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        full_kv_cache = attn_inputs.get("full_kv_cache")
+        full_block_table = attn_inputs.get("full_block_table")
+        full_slot_mapping = attn_inputs.get("full_slot_mapping")
+        if full_kv_cache is None or full_block_table is None or full_slot_mapping is None:
+            kv_cache, block_tables = past_key_values.build_full_kv_for_prefill(
+                kv, context_lens, attn_inputs["cu_q_lens"], actual_q_lens=q_lens
+            )
+        else:
+            token_offsets = torch.arange(kv.shape[1], dtype=torch.int32, device=kv.device).unsqueeze(0)
+            valid_mask = token_offsets < q_lens.unsqueeze(1)
+            kv_flat = kv[valid_mask].reshape(-1, self.head_dim)
+            if kv_flat.numel() > 0:
+                self.scatter_nd_update(
+                    full_kv_cache.view(-1, self.head_dim),
+                    full_slot_mapping.reshape(-1, 1),
+                    kv_flat,
+                )
+            kv_cache = full_kv_cache
+            block_tables = full_block_table
+
+        win_slot_mapping = attn_inputs.get("win_slot_mapping")
+        if win_slot_mapping is None:
+            win_slot_mapping = past_key_values.get_win_slot_mapping(context_lens, q_lens, pad_to_window=True)
+        full_kv_gather_indices = attn_inputs.get("full_kv_gather_indices")
+        if full_kv_gather_indices is None:
+            full_kv_gather_indices = past_key_values.get_full_kv_gather_indices(context_lens, q_lens)
+        past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping, full_kv_gather_indices, context_lens)
+        return kv_cache, block_tables
+
     def _run_attn(self, q, kv_cache, block_tables, seq_lens, batch_size, seq_length,
                   compress_ratio, cu_q_lens=None, cmp_kv_cache=None, cmp_block_tables=None,
                   cmp_sparse_indices=None, q_lens=None, sas_metadata=None):
@@ -2012,20 +1961,14 @@ class DeepseekV4Attention(nn.Module):
             attn_seq_lens = current_seq_lens
         if is_prefill:
             with _profile_timer(self.layer_idx, "cache_update"):
-                kv_cache, block_tables = past_key_values.build_full_kv_for_prefill(kv, context_lens, cu_q_lens_padded, actual_q_lens=q_lens)
-                win_slot_mapping = past_key_values.get_win_slot_mapping(context_lens, q_lens, pad_to_window=True)
-                full_kv_gather_indices = past_key_values.get_full_kv_gather_indices(context_lens, q_lens)
-                past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping, full_kv_gather_indices, context_lens)
+                kv_cache, block_tables = self._prepare_prefill_ori_kv(
+                    kv, past_key_values, context_lens, q_lens, attn_inputs
+                )
         else:
             kv_flat = kv.reshape(-1, self.head_dim)
             self.scatter_nd_update(
                 attn_inputs["win_kv_cache"].view(-1, self.head_dim),
                 attn_inputs["win_slot_mapping"].reshape(-1, 1),
-                kv_flat,
-            )
-            self.scatter_nd_update(
-                attn_inputs["kv_cache"].view(-1, self.head_dim),
-                attn_inputs["kv_slot_mapping"].reshape(-1, 1),
                 kv_flat,
             )
             kv_cache = attn_inputs["win_kv_cache"]
@@ -2035,7 +1978,6 @@ class DeepseekV4Attention(nn.Module):
         if is_prefill:
             with _profile_timer(self.layer_idx, "cache_update"):
                 past_key_values.update(kv, self.layer_idx, cu_q_lens_padded, actual_q_lens=q_lens)
-                past_key_values.seq_lens[self.layer_idx] = current_seq_lens.to(past_key_values.seq_lens.dtype)
         return out
 
     def _sparse_attention(self, q, kv, past_key_values, context_lens, cmp_sparse_indices=None,
@@ -2052,20 +1994,14 @@ class DeepseekV4Attention(nn.Module):
             attn_seq_lens = current_seq_lens
         if is_prefill:
             with _profile_timer(self.layer_idx, "cache_update"):
-                kv_cache, block_tables = past_key_values.build_full_kv_for_prefill(kv, context_lens, cu_q_lens_padded, actual_q_lens=q_lens)
-                win_slot_mapping = past_key_values.get_win_slot_mapping(context_lens, q_lens, pad_to_window=True)
-                full_kv_gather_indices = past_key_values.get_full_kv_gather_indices(context_lens, q_lens)
-                past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping, full_kv_gather_indices, context_lens)
+                kv_cache, block_tables = self._prepare_prefill_ori_kv(
+                    kv, past_key_values, context_lens, q_lens, attn_inputs
+                )
         else:
             kv_flat = kv.reshape(-1, self.head_dim)
             self.scatter_nd_update(
                 attn_inputs["win_kv_cache"].view(-1, self.head_dim),
                 attn_inputs["win_slot_mapping"].reshape(-1, 1),
-                kv_flat,
-            )
-            self.scatter_nd_update(
-                attn_inputs["kv_cache"].view(-1, self.head_dim),
-                attn_inputs["kv_slot_mapping"].reshape(-1, 1),
                 kv_flat,
             )
             kv_cache = attn_inputs["win_kv_cache"]
@@ -2080,7 +2016,6 @@ class DeepseekV4Attention(nn.Module):
         if is_prefill:
             with _profile_timer(self.layer_idx, "cache_update"):
                 past_key_values.update(kv, self.layer_idx, cu_q_lens_padded, actual_q_lens=q_lens)
-                past_key_values.seq_lens[self.layer_idx] = current_seq_lens.to(past_key_values.seq_lens.dtype)
         return out
 
     def _attn_post(self, o, position_embeddings):
