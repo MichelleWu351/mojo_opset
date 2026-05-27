@@ -19,6 +19,7 @@ from mojo_opset.tests.utils import auto_switch_platform, bypass_not_implemented
 
 SPARSE_BLOCK_SIZE = 64
 HEAD_DIM = 128
+MIN_SPARSE_LEN = 512
 
 MODEL_SPECS = [
     # (name, head_dim, num_query_heads, num_kv_heads)
@@ -32,26 +33,30 @@ MODEL_SPECS = [
     ("M8-14B", 128, 64, 8),
 ]
 
-# (q_seqlen, share_len, base_kv, sparsity, fixed_tail, dtype)
-# Minimal set covering all required parameter values:
+# (q_seqlen, share_len, base_kv, sparsity, fixed_tail, cache_block_size, dtype)
+# Covers all required parameter values:
 #   share_len ∈ {128, 256}
 #   sparsity ∈ {2, 4}  (sparse_ratio 0.5, 0.25)
-#   fixed_tail ∈ {32, 64}
+#   fixed_tail ∈ {8, 16}
+#   cache_block_size ∈ {64, 256}
 #   dtype ∈ {fp16, bf16}
 #   base_kv ∈ {0, 1024, 2048}
-#   q_seqlen ∈ {8k, 16k, 32k}
+#   q_seqlen ∈ {8k, 10k, 16k, 24k, 32k}
 SCENARIOS = [
-    (8192,  128, 0,    4, 32, torch.float16),
-    (8192,  256, 2048, 2, 64, torch.bfloat16),
-    (16384, 128, 1024, 4, 64, torch.float16),
-    (16384, 256, 0,    2, 32, torch.bfloat16),
-    (32768, 256, 0,    4, 32, torch.float16),
+    (8192,   128, 0,    4, 8,  64,  torch.float16),
+    (8192,   256, 2048, 2, 16, 256, torch.bfloat16),
+    (10240,  256, 0,    4, 8,  256, torch.float16),
+    (16384,  128, 1024, 4, 16, 64,  torch.bfloat16),
+    (16384,  256, 0,    2, 8,  64,  torch.float16),
+    (24576,  128, 2048, 2, 16, 256, torch.bfloat16),
+    (32768,  256, 0,    4, 8,  256, torch.float16),
 ]
 
-# 64k/128k only with lightweight model to avoid OOM
+# 64k/80k/128k only with lightweight model to avoid OOM - enhanced
 LARGE_SCENARIOS = [
-    (65536,  256, 0, 4, 32, torch.float16),
-    (131072, 256, 0, 2, 64, torch.float16),
+    (65536,  256, 0,    4, 16, 64,  torch.float16),
+    (81920,  256, 1024, 2, 8,  256, torch.bfloat16),
+    (131072, 256, 0,    2, 16, 64,  torch.float16),
 ]
 
 _SMALL_MODEL = MODEL_SPECS[0]  # new_model_1 (qH=8, kvH=2)
@@ -69,7 +74,7 @@ for _s in LARGE_SCENARIOS:
 
 
 def _compute_K(total_kv_len, sparse_block_size=SPARSE_BLOCK_SIZE,
-               sparse_ratio=0.25, fixed_tail=32):
+               sparse_ratio=0.25, fixed_tail=8):
     num_blocks = (total_kv_len + sparse_block_size - 1) // sparse_block_size
     ft = min(fixed_tail, num_blocks)
     sort_blocks = max(num_blocks - ft, 0)
@@ -92,8 +97,11 @@ def _make_sfa_inputs(
     base_kv: int,
     G: int,
     sparse_ratio: float = 0.25,
-    fixed_tail: int = 32,
+    fixed_tail: int = 8,
+    cache_block_size: int = 64,
     dtype: torch.dtype = torch.float16,
+    head_reserve: int = 0,
+    tail_reserve: int = 0,
 ) -> dict:
     device = _device()
     B_req = 1
@@ -107,10 +115,10 @@ def _make_sfa_inputs(
     softmax_scale = 1.0 / (head_dim ** 0.5)
     cumsum_q = [0, q_seqlen]
 
-    cache_block_size = sparse_block_size
     max_blocks_needed = (total_kv + cache_block_size - 1) // cache_block_size
     table_len = max_blocks_needed
     num_blocks = table_len + 4
+    num_sparse_blocks = (total_kv + sparse_block_size - 1) // sparse_block_size
 
     k_cache = torch.randn(num_blocks, cache_block_size, num_kv_heads, head_dim,
                            dtype=dtype, device=device)
@@ -126,21 +134,20 @@ def _make_sfa_inputs(
     seq_len_flat = torch.zeros(G, dtype=torch.int32, device=device)
     indices_flat = torch.zeros(G, num_kv_heads, K, dtype=torch.int32, device=device)
 
-    chunk_size = q_seqlen // G if G > 0 else 0
+    chunk_size = (q_seqlen - head_reserve - tail_reserve) // G if G > 0 else 0
     for i in range(G):
         group_qid[i] = 0
-        group_q_start[i] = i * chunk_size
-        group_q_len_t[i] = chunk_size if i < G - 1 else (q_seqlen - i * chunk_size)
+        group_q_start[i] = head_reserve + i * chunk_size
+        group_q_len_t[i] = chunk_size if i < G - 1 else (q_seqlen - head_reserve - tail_reserve - i * chunk_size)
 
-        max_logical_blocks = max_blocks_needed
         ft, sort_n, topk, num_selected = 0, 0, 0, 0
-        if max_logical_blocks > 0:
-            ft = min(fixed_tail, max_logical_blocks)
-            sort_n = max(max_logical_blocks - ft, 0)
+        if num_sparse_blocks > 0:
+            ft = min(fixed_tail, num_sparse_blocks)
+            sort_n = max(num_sparse_blocks - ft, 0)
             topk = max(1, int(sort_n * sparse_ratio + 0.5)) if sort_n > 0 else 0
-            num_selected = min(topk + ft, max_logical_blocks, K)
+            num_selected = min(topk + ft, num_sparse_blocks, K)
 
-        if max_logical_blocks > 0 and num_selected > 0:
+        if num_sparse_blocks > 0 and num_selected > 0:
             if sort_n > 0 and num_selected > ft:
                 n_topk = min(topk, num_selected - ft, sort_n)
             else:
@@ -172,6 +179,13 @@ def _make_sfa_inputs(
                     indices_flat[i, h, num_selected:] = pad_val
         seq_len_flat[i] = num_selected
 
+    # group_use_dense: [G], per-group dense flag (1=dense, 0=sparse)
+    # In production, determined by layer-specific q-position ratio config.
+    # For testing: mark first group as dense to exercise the dense code path.
+    group_use_dense = torch.zeros(G, dtype=torch.int32, device=device)
+    if G > 0:
+        group_use_dense[0] = 1
+
     return dict(
         q=q,
         k_cache=k_cache,
@@ -186,7 +200,7 @@ def _make_sfa_inputs(
         group_q_len=group_q_len_t,
         cumsum_q_len=torch.tensor(cumsum_q, dtype=torch.int32, device=device),
         base_kv_len=torch.tensor(base_kv_lens, dtype=torch.int32, device=device),
-        group_use_dense=None,
+        group_use_dense=group_use_dense,
         softmax_scale=softmax_scale,
         num_kv_heads=num_kv_heads,
         num_query_heads=num_query_heads,
@@ -218,11 +232,11 @@ def test_sfa_ttx_uses_group_level_union_across_kv_heads():
         num_query_heads=8,
         num_kv_heads=2,
         head_dim=HEAD_DIM,
-        q_seqlen=64,
+        q_seqlen=1024,
         base_kv=0,
         G=2,
         sparse_ratio=0.25,
-        fixed_tail=2,
+        fixed_tail=8,
         dtype=torch.float16,
     )
     device = kw["q"].device
@@ -246,11 +260,11 @@ def test_sfa_ttx_masks_partial_last_sparse_block():
         num_query_heads=8,
         num_kv_heads=2,
         head_dim=HEAD_DIM,
-        q_seqlen=70,
+        q_seqlen=1024,
         base_kv=0,
         G=1,
-        sparse_ratio=1.0,
-        fixed_tail=0,
+        sparse_ratio=0.25,
+        fixed_tail=8,
         dtype=torch.float16,
     )
     device = kw["q"].device
@@ -265,16 +279,16 @@ def test_sfa_ttx_masks_partial_last_sparse_block():
 
 @pytest.mark.parametrize(
     "model_name,head_dim,num_query_heads,num_kv_heads,"
-    "q_seqlen,share_len,base_kv,sparsity,fixed_tail,dtype",
+    "q_seqlen,share_len,base_kv,sparsity,fixed_tail,cache_block_size,dtype",
     _ALL_PARAMS,
 )
 @auto_switch_platform()
 @bypass_not_implemented
 def test_sfa_model_specs(
     model_name, head_dim, num_query_heads, num_kv_heads,
-    q_seqlen, share_len, base_kv, sparsity, fixed_tail, dtype,
+    q_seqlen, share_len, base_kv, sparsity, fixed_tail, cache_block_size, dtype,
 ):
-    G = q_seqlen // share_len
+    G = (q_seqlen - MIN_SPARSE_LEN) // share_len
     sr = 1.0 / sparsity
     kw = _make_sfa_inputs(
         num_query_heads=num_query_heads,
@@ -285,7 +299,10 @@ def test_sfa_model_specs(
         G=G,
         sparse_ratio=sr,
         fixed_tail=fixed_tail,
+        cache_block_size=cache_block_size,
         dtype=dtype,
+        head_reserve=MIN_SPARSE_LEN // 2,
+        tail_reserve=MIN_SPARSE_LEN // 2,
     )
     op = MojoSALSSFA()
     torch_cls = op._registry.get("torch")

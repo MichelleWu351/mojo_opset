@@ -7,9 +7,9 @@ from mojo_opset.tests.utils import bypass_not_implemented
 
 
 HEAD_DIM = 128
-SPARSE_BLOCK_SIZE = 16
+SPARSE_BLOCK_SIZE = 64
 DEFAULT_SPARSE_RATIO = 0.25
-DEFAULT_FIXED_TAIL = 32
+DEFAULT_FIXED_TAIL = 8
 
 MODEL_SPECS = [
     ("new_model_1", 2),
@@ -22,20 +22,31 @@ MODEL_SPECS = [
     ("M8-14B", 8),
 ]
 
-# (q_seqlen, share_len, kv_seqlen)
+# (q_seqlen, share_len, kv_seqlen, cache_block_size)
 PREFILL_SCENARIOS = [
-    (8192,  128, 1024),
-    (8192,  256, 2048),
-    (16384, 256, 1024),
-    (32768, 256, 2048),
+    (8192,   128, 1024, 64),
+    (8192,   256, 2048, 256),
+    (10240,  256, 1024, 256),
+    (16384,  256, 1024, 256),
+    (24576,  256, 1024, 256),
+    (32768,  256, 2048, 256),
 ]
 
+# 64k/80k/128k only with lightweight model to avoid OOM
+LARGE_PREFILL_SCENARIOS = [
+    (65536,  256, 512,  64),
+    (81920,  256, 1024, 256),
+    (131072, 256, 256,  64),
+]
 
-def _generate_sals_indexer_data(G, seq_lengths, kv_heads):
+_SMALL_MODEL = MODEL_SPECS[0]  # new_model_1
+
+
+def _generate_sals_indexer_data(G, seq_lengths, kv_heads, *, cache_block_size=64):
     device = "npu" if torch.npu.is_available() else "cpu"
     sbs = SPARSE_BLOCK_SIZE
     max_seqlen = max(seq_lengths) if seq_lengths else 0
-    max_bpg = max((max_seqlen + sbs - 1) // sbs, 1)
+    max_bpg = max((max_seqlen + cache_block_size - 1) // cache_block_size, 1)
     num_phys = max_bpg * G + 4
 
     max_count = max((max_seqlen + sbs - 1) // sbs, 0)
@@ -46,7 +57,7 @@ def _generate_sals_indexer_data(G, seq_lengths, kv_heads):
     ))
 
     query = torch.randn(G, kv_heads, HEAD_DIM, dtype=torch.float16, device=device)
-    key = torch.randn(num_phys, sbs, kv_heads, HEAD_DIM, dtype=torch.float16, device=device)
+    key = torch.randn(num_phys, cache_block_size, kv_heads, HEAD_DIM, dtype=torch.float16, device=device)
 
     block_table = torch.zeros(G, max_bpg, dtype=torch.int32, device=device)
     for g in range(G):
@@ -70,14 +81,29 @@ def _generate_sals_indexer_data(G, seq_lengths, kv_heads):
 
 
 @pytest.mark.parametrize("model_name,kv_heads", MODEL_SPECS)
-@pytest.mark.parametrize("q_seqlen,share_len,kv_seqlen", PREFILL_SCENARIOS)
+@pytest.mark.parametrize("q_seqlen,share_len,kv_seqlen,cache_block_size", PREFILL_SCENARIOS)
 @auto_switch_platform(set_perf=True)
 @bypass_not_implemented
-def test_sals_indexer_perf(model_name, kv_heads, q_seqlen, share_len, kv_seqlen):
+def test_sals_indexer_perf(model_name, kv_heads, q_seqlen, share_len, kv_seqlen, cache_block_size):
     G = q_seqlen // share_len
     (query, key, block_table, actual_seq_lengths_key, act_n_counts,
      sbs, sparse_ratio, fixed_tail_count, sparse_count,
-     score_mode, max_seqlen_key) = _generate_sals_indexer_data(G, [kv_seqlen] * G, kv_heads)
+     score_mode, max_seqlen_key) = _generate_sals_indexer_data(G, [kv_seqlen] * G, kv_heads, cache_block_size=cache_block_size)
+    indexer = MojoSALSIndexer()
+    perf(lambda: indexer(query, key, block_table, actual_seq_lengths_key, act_n_counts,
+                         sbs, sparse_ratio, fixed_tail_count, sparse_count,
+                         score_mode, max_seqlen_key))
+
+
+@pytest.mark.parametrize("q_seqlen,share_len,kv_seqlen,cache_block_size", LARGE_PREFILL_SCENARIOS)
+@auto_switch_platform(set_perf=True)
+@bypass_not_implemented
+def test_sals_indexer_large_perf(q_seqlen, share_len, kv_seqlen, cache_block_size):
+    _model_name, kv_heads = _SMALL_MODEL
+    G = q_seqlen // share_len
+    (query, key, block_table, actual_seq_lengths_key, act_n_counts,
+     sbs, sparse_ratio, fixed_tail_count, sparse_count,
+     score_mode, max_seqlen_key) = _generate_sals_indexer_data(G, [kv_seqlen] * G, kv_heads, cache_block_size=cache_block_size)
     indexer = MojoSALSIndexer()
     perf(lambda: indexer(query, key, block_table, actual_seq_lengths_key, act_n_counts,
                          sbs, sparse_ratio, fixed_tail_count, sparse_count,
