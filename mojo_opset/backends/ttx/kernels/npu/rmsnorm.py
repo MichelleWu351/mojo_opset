@@ -13,18 +13,21 @@ from mojo_opset.backends.ttx.kernels.utils import torch_to_triton_dtype
 from mojo_opset.utils.misc import get_bool_env
 
 IS_DETERMINISTIC = get_bool_env("MOJO_DETERMINISTIC", default=False)
-COL_BLOCKING_THRESHOLD = 2048
+COL_BLOCKING_THRESHOLD = 10240
 
 _CASTING_MODE_NONE: tl.constexpr = tl.constexpr(-1)
 _CASTING_MODE_LLAMA: tl.constexpr = tl.constexpr(0)
 _CASTING_MODE_GEMMA: tl.constexpr = tl.constexpr(1)
 
 TOKEN_BLOCK_SIZE_TABLE = {
-    2048: 4,
-    1024: 8,
-    512: 10,
-    256: 18,
-    128: 24,
+    10240: 2,
+    8192: 4,
+    4096: 6,
+    2048: 8,
+    1024: 10,
+    512: 18,
+    256: 24,
+    128: 48,
 }
 
 
@@ -39,9 +42,18 @@ def rms_norm_fwd_heuristics(args):
                 return block_size
         return 1
     else:
-        return 4
+        return 1
 
-
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_N": 2048}), 
+        triton.Config({"BLOCK_SIZE_N": 4096}), 
+        triton.Config({"BLOCK_SIZE_N": 8192}), 
+        triton.Config({"BLOCK_SIZE_N": 6144}),
+        triton.Config({"BLOCK_SIZE_N": 10240}),  
+    ],
+    key=["n_rows", "n_cols"],
+)
 @triton.heuristics({"BLOCK_SIZE_M": rms_norm_fwd_heuristics})
 @libentry()
 @triton.jit
@@ -111,6 +123,64 @@ def _rmsnorm_infer_kernel(
                 mask=row_mask[:, None] & col_mask[None, :],
             )
 
+@libentry()
+@triton.jit
+def _rmsnorm_infer_kernel_single(
+    X_ptr,
+    Y_ptr,
+    W_ptr,
+    stride_x_row,
+    stride_y_row,
+    n_rows,
+    n_cols,
+    eps,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    grid_size = tl.num_programs(axis=0)
+
+    num_row_tasks = (n_rows + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    
+    col_offsets = tl.arange(0, BLOCK_SIZE_N)
+    col_mask = col_offsets < n_cols
+    
+    w_ptrs = W_ptr + col_offsets
+    w = tl.load(w_ptrs, mask=col_mask, other=0.0)
+    w_f32 = w.to(tl.float32)
+
+
+    for row_task_id in range(pid, num_row_tasks, grid_size):
+        block_start_row = row_task_id * BLOCK_SIZE_M
+
+        current_row_offsets = block_start_row + tl.arange(0, BLOCK_SIZE_M)
+        row_mask = current_row_offsets < n_rows
+
+        x_ptrs = X_ptr + (current_row_offsets[:, None] * stride_x_row + col_offsets[None, :])
+
+        x = tl.load(x_ptrs, mask=row_mask[:, None] & col_mask[None, :], other=0.0).to(tl.float32)
+
+        ss_acc = tl.sum(x * x, axis=1)
+
+        ss_acc = tl.where(row_mask, ss_acc, 0)
+
+        mean_square = ss_acc / n_cols
+        rrms = tl.rsqrt(mean_square + eps)
+
+        rrms = tl.where(row_mask, rrms, 0.0)
+
+        y_ptrs = Y_ptr + (current_row_offsets[:, None] * stride_y_row + col_offsets[None, :])
+
+        x_normalized = x * rrms[:, None]
+
+        y = x_normalized * w_f32[None, :]
+
+        tl.store(
+            y_ptrs,
+            y.to(Y_ptr.dtype.element_ty),
+            mask=row_mask[:, None] & col_mask[None, :],
+        )
+        
 
 def rmsnorm_infer_impl(
     x: torch.Tensor,
@@ -134,17 +204,30 @@ def rmsnorm_infer_impl(
 
     grid = (num_programs,)
 
-    _rmsnorm_infer_kernel[grid](
-        x,
-        y,
-        w,
-        X_2d.stride(0),
-        y.stride(0),
-        n_rows=n_rows,
-        n_cols=n_cols,
-        eps=eps,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-    )
+    if BLOCK_SIZE_N < n_cols:
+        _rmsnorm_infer_kernel[grid](
+            x,
+            y,
+            w,
+            X_2d.stride(0),
+            y.stride(0),
+            n_rows=n_rows,
+            n_cols=n_cols,
+            eps=eps,
+        )
+    else:
+        _rmsnorm_infer_kernel_single[grid](
+            x,
+            y,
+            w,
+            X_2d.stride(0),
+            y.stride(0),
+            n_rows=n_rows,
+            n_cols=n_cols,
+            eps=eps,
+            BLOCK_SIZE_M=sorted(TOKEN_BLOCK_SIZE_TABLE.items())[-1][1]*(torch.float32.itemsize//(x.element_size())),
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+        )
 
     return y.reshape(*shape)
 
