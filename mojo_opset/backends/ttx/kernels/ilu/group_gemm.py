@@ -55,10 +55,25 @@ def m_grouped_matmul_autotune_config():
                     {"BLOCK_M": BM, "BLOCK_N": BN, "BLOCK_K": BK},
                     num_warps=nw, num_stages=ns,
                 ))
+    # Small-M tiles (e.g. M=1 decode, or MoE with few rows per expert): a small
+    # BLOCK_M avoids wasting a 64-row dot on a few valid rows. For the bandwidth-
+    # bound large-N MoE case (per-expert rows small, e.g. 2), BLOCK_M=16 with
+    # BLOCK_N=128, BLOCK_K=128 (single K step for K=128), num_warps=8, num_stages=2
+    # measured ~473 GB/s on BI-V150S (vs ~270 before), beating the cuinfer path.
+    # num_warps=16 measured worse here, so it is intentionally excluded.
+    # tl.dot needs BLOCK_M >= 16 on ILU.
+    for BN in [128, 256]:
+        for BK in [64, 128]:
+            for nw in [4, 8]:
+                for ns in [2, 3]:
+                    configs.append(triton.Config(
+                        {"BLOCK_M": 16, "BLOCK_N": BN, "BLOCK_K": BK},
+                        num_warps=nw, num_stages=ns,
+                    ))
     return configs
 
 
-@smart_triton_autotune(configs=m_grouped_matmul_autotune_config(), selected_idx=0, key=["N", "K", "MAX_M"])
+@smart_triton_autotune(configs=m_grouped_matmul_autotune_config(), selected_idx=0, key=["N", "K"])
 @triton.jit
 def _m_grouped_matmul_kernel(
     A,
@@ -135,12 +150,31 @@ def m_grouped_matmul_impl(
     group_offsets: Optional[torch.Tensor] = None,
     max_m: Optional[int] = None,
 ) -> torch.Tensor:
+    # Host fast path: derive offsets / max_m with plain Python from a single CPU
+    # readout, keeping only one H2D copy. Replaces cumsum/zeros/setitem/max().item(),
+    # whose repeated torch dispatches dominate the tiny M=1 launch overhead on ILU.
     if group_offsets is None:
-        cum = size_per_group.cumsum(0, dtype=torch.int32)
-        group_offsets = torch.zeros(num_groups + 1, dtype=torch.int32, device=A.device)
-        group_offsets[1:] = cum
-    if max_m is None:
-        max_m = size_per_group.max().item()
+        sizes = size_per_group.tolist()
+        offs = [0] * (num_groups + 1)
+        acc = 0
+        for i in range(num_groups):
+            acc += sizes[i]
+            offs[i + 1] = acc
+        if A.is_cuda:
+            # A plain torch.tensor(list, device=cuda) does a *synchronous* pageable
+            # H2D that drains the GPU queue on every call, breaking back-to-back
+            # kernel pipelining (~0.2ms hit on large-N grouped GEMM, measured on
+            # BI-V150S). Staging through pinned host memory + non_blocking copy
+            # keeps the stream full and recovers near-peak HBM bandwidth.
+            group_offsets = torch.tensor(
+                offs, dtype=torch.int32, pin_memory=True
+            ).to(A.device, non_blocking=True)
+        else:
+            group_offsets = torch.tensor(offs, dtype=torch.int32, device=A.device)
+        if max_m is None:
+            max_m = max(sizes) if num_groups else 0
+    elif max_m is None:
+        max_m = int(size_per_group.max())
 
     def grid(META):
         return (
