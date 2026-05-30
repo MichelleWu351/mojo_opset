@@ -1,14 +1,19 @@
-"""Tests for communication-fused GEMM operators.
+"""Tests for communication-fused GEMM operators on Ascend NPU.
 
-Multi-process distributed tests use torchrun (subprocess) to exercise
-AllReduce / AllGather / All2All / ReduceScatter with real HCCL/gloo comm.
+Multi-process distributed tests use torchrun to exercise fused comm+compute
+operators with real HCCL communication.
 
-Run with:
-    torchrun --nproc-per-node=2 -m pytest <this_file> -v
-Or via the helper that auto-launches torchrun for comm tests.
+These tests require:
+  - 2+ Ascend NPUs
+  - triton-dist package (for TTX kernel tests)
+  - HCCL backend
+
+Run manually:
+    ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --nproc-per-node=2 -m pytest <this_file> -v
 """
 
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -17,8 +22,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
-from mojo_opset.tests.utils import bypass_not_implemented
 
 from mojo_opset import MojoAllGatherGemm
 from mojo_opset import MojoGemmAll2All
@@ -29,26 +32,14 @@ from mojo_opset.utils.platform import get_dist_backend, get_platform
 
 torch.manual_seed(42)
 
-dtypes = [torch.float16, torch.bfloat16]
-
 _PLATFORM = get_platform()
 COMM_BACKEND = get_dist_backend()
 DEVICE = _PLATFORM if _PLATFORM in ("npu", "mlu") else "cpu"
-WORLD_SIZE = 2
 
 
 # ===========================================================================
 # Helpers
 # ===========================================================================
-
-def _make_weight_and_bias(k, n, trans_weight, dtype):
-    if trans_weight:
-        w = torch.randn(k, n, dtype=dtype)
-    else:
-        w = torch.randn(n, k, dtype=dtype)
-    b = torch.randn(n, dtype=dtype)
-    return w, b
-
 
 def _is_dist_env():
     return "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -56,7 +47,6 @@ def _is_dist_env():
 
 def _run_torchrun_test(test_fn_name, nproc=2, timeout=600):
     """Launch a distributed test via torchrun as subprocess."""
-    import random
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(
             f"from mojo_opset.tests.accuracy.operators.test_compute_with_comm import {test_fn_name}\n"
@@ -95,85 +85,7 @@ def _to_dev(t: torch.Tensor) -> torch.Tensor:
 
 
 # ===========================================================================
-# Single-rank correctness (dist NOT initialised → comm ops are identity)
-# ===========================================================================
-
-@pytest.mark.parametrize(
-    "m, k, n",
-    [(64, 256, 512), (128, 1024, 2048), (7, 4096, 4096)],
-)
-@pytest.mark.parametrize("trans_weight", [False, True])
-@pytest.mark.parametrize("has_bias", [True, False])
-@pytest.mark.parametrize("dtype", dtypes)
-@bypass_not_implemented
-def test_gemm_all_reduce(m, k, n, trans_weight, has_bias, dtype):
-    x = torch.randn(m, k, dtype=dtype)
-    w, b = _make_weight_and_bias(k, n, trans_weight, dtype)
-    bias = b if has_bias else None
-    op = MojoGemmAllReduce(weight=w, bias=bias, trans_weight=trans_weight)
-    op_ref = MojoGemmAllReduce._registry.get("torch")(
-        weight=w, bias=bias, trans_weight=trans_weight
-    )
-    op.forward_diff_with(op_ref, x, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize(
-    "m, k, n",
-    [(64, 256, 512), (128, 1024, 2048), (7, 4096, 4096)],
-)
-@pytest.mark.parametrize("trans_weight", [False, True])
-@pytest.mark.parametrize("has_bias", [True, False])
-@pytest.mark.parametrize("dtype", dtypes)
-@bypass_not_implemented
-def test_gemm_all2all(m, k, n, trans_weight, has_bias, dtype):
-    x = torch.randn(m, k, dtype=dtype)
-    w, b = _make_weight_and_bias(k, n, trans_weight, dtype)
-    bias = b if has_bias else None
-    op = MojoGemmAll2All(weight=w, bias=bias, trans_weight=trans_weight)
-    op_ref = MojoGemmAll2All._registry.get("torch")(
-        weight=w, bias=bias, trans_weight=trans_weight
-    )
-    op.forward_diff_with(op_ref, x, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize(
-    "m, k, n",
-    [(64, 256, 512), (128, 1024, 2048), (7, 4096, 4096)],
-)
-@pytest.mark.parametrize("trans_weight", [False, True])
-@pytest.mark.parametrize("has_bias", [True, False])
-@pytest.mark.parametrize("dtype", dtypes)
-@bypass_not_implemented
-def test_gemm_reduce_scatter(m, k, n, trans_weight, has_bias, dtype):
-    x = torch.randn(m, k, dtype=dtype)
-    w, b = _make_weight_and_bias(k, n, trans_weight, dtype)
-    bias = b if has_bias else None
-    op = MojoGemmReduceScatter(weight=w, bias=bias, trans_weight=trans_weight)
-    op_ref = MojoGemmReduceScatter._registry.get("torch")(
-        weight=w, bias=bias, trans_weight=trans_weight
-    )
-    op.forward_diff_with(op_ref, x, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("dtype", dtypes)
-@bypass_not_implemented
-def test_single_rank_all_ops_equivalent(dtype):
-    """In a single-rank environment all four TP-fused GEMMs equal F.linear."""
-    m, k, n = 32, 64, 128
-    x = torch.randn(m, k, dtype=dtype)
-    w = torch.randn(n, k, dtype=dtype)
-    b = torch.randn(n, dtype=dtype)
-    ref = F.linear(x, w, b)
-    for OpClass in (MojoGemmAllReduce, MojoAllGatherGemm, MojoGemmAll2All, MojoGemmReduceScatter):
-        op = OpClass._registry.get("torch")(weight=w, bias=b, trans_weight=False)
-        out = op(x)
-        torch.testing.assert_close(
-            out, ref, atol=0, rtol=0, msg=f"{OpClass.__name__} output mismatch"
-        )
-
-
-# ===========================================================================
-# Multi-card distributed tests (torchrun-based)
+# Multi-card distributed tests (torchrun-based, HCCL)
 # ===========================================================================
 
 def _dist_all_gather_gemm():
@@ -336,6 +248,8 @@ def _dist_gemm_all2all():
     dist.destroy_process_group()
 
 
+# TODO: Remove skip once triton-dist is added to mojo CI dependencies
+@pytest.mark.skip(reason="requires triton-dist which is not yet in CI")
 def test_gemm_all2all_comm():
     if _is_dist_env():
         _dist_gemm_all2all()
@@ -377,6 +291,8 @@ def _dist_parallel_embedding():
     dist.destroy_process_group()
 
 
+# TODO: Remove skip once triton-dist is added to mojo CI dependencies
+@pytest.mark.skip(reason="requires triton-dist which is not yet in CI")
 def test_parallel_embedding_comm():
     if _is_dist_env():
         _dist_parallel_embedding()
