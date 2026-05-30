@@ -669,6 +669,7 @@ def _paged_prefill_kv_dequant_kernel(
                 qk = tl.where(mask, qk, float("-inf"))
 
                 m_ij = tl.maximum(m_i, tl.max(qk, 1))
+                                
                 qk = qk - m_ij[:, None]
 
                 p = tl.math.exp(qk)
@@ -741,12 +742,12 @@ def paged_attention_prefill_with_kv_dequant_impl(
     if block_tables_i32 is None:
         block_tables_i32 = block_tables.to(torch.int32)
 
-    aux_mask = torch.ones(1024, 1024 * 3, dtype=torch.bool).tril(1024).npu()
+    aux_mask = torch.ones(1024, 1024 * 3, dtype=torch.bool,device=q.device).tril(1024)
 
     o = out
 
-    CHUNK_SIZE = 64 if head_dim > 128 else 128
-    BLOCK_SIZE_N = min(64, triton.next_power_of_2(block_size))
+    CHUNK_SIZE = 128
+    BLOCK_SIZE_N = min(128, triton.next_power_of_2(block_size))
     cube_num = get_num_cores("cube")
     grid = (cube_num,)
 
