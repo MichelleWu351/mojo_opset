@@ -108,7 +108,7 @@ jobs:
           echo "Running compute+comm distributed tests..."
           unset ASCEND_VISIBLE_DEVICES
           unset ASCEND_RT_VISIBLE_DEVICES
-          python3 -m pytest -v mojo_opset/tests/accuracy/operators/test_compute_with_comm.py || test $? -eq 5
+          python3 -m pytest -v mojo_opset/tests/accuracy/operators/test_compute_with_comm.py; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 5 ]
       - name: test-TTX-graph
         shell: bash
         run: |

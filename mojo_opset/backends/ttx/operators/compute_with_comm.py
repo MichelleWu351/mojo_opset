@@ -35,25 +35,24 @@ class TTXAllGatherGemm(MojoAllGatherGemm):
     ):
         super().__init__(weight, bias, trans_weight, process_group, gather_dim)
         self._peer_mem = None
+        self._runtime = None
         self._rank = None
         self._world_size = None
 
     def _ensure_shmem(self, K: int, dtype: torch.dtype) -> None:
-        if self._peer_mem is not None:
-            return
-
-        runtime = MojoSymmetricMemoryManager.get_or_create(
-            process_group=self.process_group,
-            backend="ttx",
-            shmem_heap_size_mb=_get_ttx_shmem_size_mb(),
-        )
-        runtime.get_backend_manager()
-
-        self._rank = runtime.rank
-        self._world_size = runtime.world_size
+        if self._rank is None:
+            runtime = MojoSymmetricMemoryManager.get_or_create(
+                process_group=self.process_group,
+                backend="ttx",
+                shmem_heap_size_mb=_get_ttx_shmem_size_mb(),
+            )
+            runtime.get_backend_manager()
+            self._runtime = runtime
+            self._rank = runtime.rank
+            self._world_size = runtime.world_size
 
         flat_size = allgather_gemm_peer_mem_size(K, self._world_size)
-        self._peer_mem = runtime.allocate_peer_mem(flat_size, dtype)
+        self._peer_mem = self._runtime.allocate_peer_mem(flat_size, dtype)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if not (dist.is_available() and dist.is_initialized()):
@@ -114,25 +113,24 @@ class TTXGemmAllReduce(MojoGemmAllReduce):
     ):
         super().__init__(weight, bias, trans_weight, process_group)
         self._peer_mem = None
+        self._runtime = None
         self._rank = None
         self._world_size = None
 
     def _ensure_shmem(self, dtype: torch.dtype) -> None:
-        if self._peer_mem is not None:
-            return
-
-        runtime = MojoSymmetricMemoryManager.get_or_create(
-            process_group=self.process_group,
-            backend="ttx",
-            shmem_heap_size_mb=_get_ttx_shmem_size_mb(),
-        )
-        runtime.get_backend_manager()
-
-        self._rank = runtime.rank
-        self._world_size = runtime.world_size
+        if self._rank is None:
+            runtime = MojoSymmetricMemoryManager.get_or_create(
+                process_group=self.process_group,
+                backend="ttx",
+                shmem_heap_size_mb=_get_ttx_shmem_size_mb(),
+            )
+            runtime.get_backend_manager()
+            self._runtime = runtime
+            self._rank = runtime.rank
+            self._world_size = runtime.world_size
 
         flat_size = gemm_allreduce_peer_mem_size()
-        self._peer_mem = runtime.allocate_peer_mem(flat_size, dtype)
+        self._peer_mem = self._runtime.allocate_peer_mem(flat_size, dtype)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if not (dist.is_available() and dist.is_initialized()):
@@ -184,25 +182,24 @@ class TTXGemmReduceScatter(MojoGemmReduceScatter):
     ):
         super().__init__(weight, bias, trans_weight, process_group, scatter_dim)
         self._peer_mem = None
+        self._runtime = None
         self._rank = None
         self._world_size = None
 
     def _ensure_shmem(self, dtype: torch.dtype) -> None:
-        if self._peer_mem is not None:
-            return
-
-        runtime = MojoSymmetricMemoryManager.get_or_create(
-            process_group=self.process_group,
-            backend="ttx",
-            shmem_heap_size_mb=_get_ttx_shmem_size_mb(),
-        )
-        runtime.get_backend_manager()
-
-        self._rank = runtime.rank
-        self._world_size = runtime.world_size
+        if self._rank is None:
+            runtime = MojoSymmetricMemoryManager.get_or_create(
+                process_group=self.process_group,
+                backend="ttx",
+                shmem_heap_size_mb=_get_ttx_shmem_size_mb(),
+            )
+            runtime.get_backend_manager()
+            self._runtime = runtime
+            self._rank = runtime.rank
+            self._world_size = runtime.world_size
 
         flat_size = gemm_reduce_scatter_peer_mem_size()
-        self._peer_mem = runtime.allocate_peer_mem(flat_size, dtype)
+        self._peer_mem = self._runtime.allocate_peer_mem(flat_size, dtype)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if not (dist.is_available() and dist.is_initialized()):
