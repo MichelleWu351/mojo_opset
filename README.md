@@ -202,7 +202,7 @@ You can build the model using Mojo Opset in the following ways:
 
     ```python
     # 1. Apply mojo opset to qwen3 model
-    mojo_opsetutils.patching.apply_mojo_to_qwen3()
+    mojo_opset.utils.patching.apply_mojo_to_qwen3()
 
     # 2. Instantiate patched model
     model = transformers.AutoModelForCausalLM("path/to/qwen3/model")

@@ -118,7 +118,7 @@ class MojoSymmetricMemoryManager:
 
         process_group = self.process_group or dist.group.WORLD
         _UID_SIZE = 136
-        uid_tensor = torch.zeros(_UID_SIZE, dtype=torch.uint8, device=f"npu:{self.rank}")
+        uid_tensor = torch.zeros(_UID_SIZE, dtype=torch.uint8, device=f"npu:{torch.npu.current_device()}")
         if self.rank == 0:
             uid_bytes = ash.aclshmem_get_unique_id()
             uid_tensor.copy_(torch.tensor(list(uid_bytes), dtype=torch.uint8))
@@ -148,7 +148,7 @@ class MojoSymmetricMemoryManager:
             if existing is not None and existing.numel() >= flat_size:
                 return existing
             import shmem as ash
-            tensor = ash.aclshmem_create_tensor([flat_size], dtype=dtype, device_id=self.rank)
+            tensor = ash.aclshmem_create_tensor([flat_size], dtype=dtype, device_id=torch.npu.current_device())
             self._team_cache[cache_key] = tensor
             return tensor
 
@@ -183,11 +183,11 @@ class MojoSymmetricMemoryManager:
 
         if manager is not None:
             if self.backend == "ttx":
-                manager.aclshmem_finialize()
+                manager.aclshmem_finalize()
             elif hasattr(manager, "finalize"):
                 manager.finalize()
-            elif hasattr(manager, "destory"):
-                manager.destory()
+            elif hasattr(manager, "destroy"):
+                manager.destroy()
 
     def _ensure_open(self) -> None:
         if self._closed:
