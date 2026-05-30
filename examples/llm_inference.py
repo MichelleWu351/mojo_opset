@@ -215,14 +215,25 @@ def get_attn_dp_shard_range(total_batch, *, global_rank, world_size, attn_tp_siz
             f"world_size={world_size} is not divisible by attn_tp_size={attn_tp_size}"
         )
 
-    dp_group_count = world_size // attn_tp_size
+    if cp_size > 1:
+        if world_size % (cp_size * attn_tp_size) != 0:
+            raise ValueError(
+                f"world_size={world_size} must be divisible by cp_size*attn_tp_size="
+                f"{cp_size * attn_tp_size} when CP is enabled"
+            )
+        # Golden CP prefill semantics: CP ranks cooperate on the same sequence,
+        # so batch ownership is controlled by prefill DP, not decode attention DP.
+        dp_group_count = world_size // cp_size // attn_tp_size
+        dp_rank = global_rank // (cp_size * attn_tp_size)
+    else:
+        dp_group_count = world_size // attn_tp_size
+        dp_rank = global_rank // attn_tp_size
     if total_batch % dp_group_count != 0:
         raise ValueError(
             f"DeepseekV4 DP requires batch_size={total_batch} to be divisible by "
             f"attn_dp_size={dp_group_count} (world_size={world_size}, attn_tp_size={attn_tp_size})."
         )
 
-    dp_rank = global_rank // attn_tp_size
     shard_size = total_batch // dp_group_count
     start = dp_rank * shard_size
     end = start + shard_size
@@ -1482,8 +1493,8 @@ def parse_args():
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--pa_max_length", type=int, default=int(os.getenv("PA_MAX_LENGTH", "2048")))
     parser.add_argument("--transformers", action="store_true", help="Use Transformers model")
-    parser.add_argument("--ep_size", type=int, default=int(os.getenv("EP_SIZE", "1")))
-    parser.add_argument("--cp_size", type=int, default=int(os.getenv("CP_SIZE", "1")))
+    parser.add_argument("--ep_size", type=int, default=int(os.getenv("EP_SIZE", "8")))
+    parser.add_argument("--cp_size", type=int, default=int(os.getenv("CP_SIZE", "8")))
     parser.add_argument("--attn_tp_size", type=int, default=int(os.getenv("ATTN_TP_SIZE", "1")))
     parser.add_argument("--lmhead_tp_size", type=int, default=int(os.getenv("LMHEAD_TP_SIZE", "1")))
     parser.add_argument("--o_proj_tp_size", type=int, default=int(os.getenv("O_PROJ_TP_SIZE", "1")))
@@ -1515,6 +1526,14 @@ def main():
     attn_tp_size = args.attn_tp_size
     lmhead_tp_size = args.lmhead_tp_size
     o_proj_tp_size = args.o_proj_tp_size
+    if world_size > 1:
+        if world_size % ep_size != 0:
+            raise ValueError(f"WORLD_SIZE={world_size} must be divisible by EP_SIZE={ep_size}")
+        if ep_size != world_size:
+            raise ValueError(
+                "DeepSeek-V4 EP migration currently supports pure EP only, "
+                f"got EP_SIZE={ep_size}, WORLD_SIZE={world_size}"
+            )
     if world_size > 1 and lmhead_tp_size > 1 and world_size % lmhead_tp_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must be divisible by LMHEAD_TP_SIZE={lmhead_tp_size}")
     if world_size > 1 and world_size % attn_tp_size != 0:
@@ -1569,7 +1588,18 @@ def main():
 
         hf_config.pa_max_length = args.pa_max_length
         hf_config.next_n = args.next_n
-        logger.info("[CONFIG] DeepSeek-V4 runtime config: pa_max_length=%s next_n=%s", args.pa_max_length, args.next_n)
+        logger.info(
+            "[CONFIG] DeepSeek-V4 runtime config: world_size=%s ep_size=%s cp_size=%s "
+            "attn_tp_size=%s lmhead_tp_size=%s o_proj_tp_size=%s pa_max_length=%s next_n=%s",
+            world_size,
+            ep_size,
+            cp_size,
+            attn_tp_size,
+            lmhead_tp_size,
+            o_proj_tp_size,
+            args.pa_max_length,
+            args.next_n,
+        )
 
         ep_rank = global_rank % ep_size if ep_size > 1 else 0
         attn_dp_size = world_size // attn_tp_size
