@@ -122,8 +122,11 @@ n_gram_prefill_impl = _get_kernel_impl(ttx_backend_module, "n_gram_prefill_impl"
 over_encoding_decode_impl = _get_kernel_impl(ttx_backend_module, "over_encoding_decode_impl")
 
 allgather_gemm_impl = _get_kernel_impl(ttx_backend_module, "allgather_gemm_impl")
+allgather_gemm_peer_mem_size = _get_kernel_impl(ttx_backend_module, "allgather_gemm_peer_mem_size")
 gemm_allreduce_impl = _get_kernel_impl(ttx_backend_module, "gemm_allreduce_impl")
+gemm_allreduce_peer_mem_size = _get_kernel_impl(ttx_backend_module, "gemm_allreduce_peer_mem_size")
 gemm_reduce_scatter_impl = _get_kernel_impl(ttx_backend_module, "gemm_reduce_scatter_impl")
+gemm_reduce_scatter_peer_mem_size = _get_kernel_impl(ttx_backend_module, "gemm_reduce_scatter_peer_mem_size")
 
 if os.getenv("MOJO_RUN_MODE", "EAGER") == "COMPILE":
     assert torch.version.__version__ >= "2.7.0", "Work with torch.compile request your torch version >= 2.7.0"

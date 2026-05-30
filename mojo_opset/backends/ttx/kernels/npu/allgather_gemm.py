@@ -200,3 +200,9 @@ def allgather_gemm_impl(
         input.dtype == torch.bfloat16,
     )
     return output
+
+
+def allgather_gemm_peer_mem_size(K: int, world_size: int) -> int:
+    """Return the flat peer_mem element count required for allgather_gemm kernel."""
+    BLOCK_SIZE_M, pvalue, buffer_num, BLOCK_SIZE_K = 128, 4, 2, 256
+    return BLOCK_SIZE_M * pvalue * world_size * buffer_num * max(K, BLOCK_SIZE_K)

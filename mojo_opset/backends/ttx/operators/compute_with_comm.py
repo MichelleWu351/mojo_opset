@@ -5,9 +5,11 @@ import torch
 import torch.distributed as dist
 
 from mojo_opset.backends.ttx.kernels import allgather_gemm_impl
+from mojo_opset.backends.ttx.kernels import allgather_gemm_peer_mem_size
 from mojo_opset.backends.ttx.kernels import gemm_allreduce_impl
+from mojo_opset.backends.ttx.kernels import gemm_allreduce_peer_mem_size
 from mojo_opset.backends.ttx.kernels import gemm_reduce_scatter_impl
-from mojo_opset.backends.ttx.kernels.npu.utils import get_num_cores
+from mojo_opset.backends.ttx.kernels import gemm_reduce_scatter_peer_mem_size
 from mojo_opset.core import MojoAllGatherGemm
 from mojo_opset.core import MojoGemmAllReduce
 from mojo_opset.core import MojoGemmReduceScatter
@@ -50,8 +52,7 @@ class TTXAllGatherGemm(MojoAllGatherGemm):
         self._rank = runtime.rank
         self._world_size = runtime.world_size
 
-        BLOCK_SIZE_M, pvalue, buffer_num, BLOCK_SIZE_K = 128, 4, 2, 256
-        flat_size = BLOCK_SIZE_M * pvalue * self._world_size * buffer_num * max(K, BLOCK_SIZE_K)
+        flat_size = allgather_gemm_peer_mem_size(K, self._world_size)
         self._peer_mem = runtime.allocate_peer_mem(flat_size, dtype)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -130,10 +131,7 @@ class TTXGemmAllReduce(MojoGemmAllReduce):
         self._rank = runtime.rank
         self._world_size = runtime.world_size
 
-        BLOCK_SIZE_M, BLOCK_SIZE_N = 128, 256
-        ncore = get_num_cores("cube")
-        pvalue, buffer_num = 4, 2
-        flat_size = BLOCK_SIZE_M * pvalue * ncore * buffer_num * BLOCK_SIZE_N
+        flat_size = gemm_allreduce_peer_mem_size()
         self._peer_mem = runtime.allocate_peer_mem(flat_size, dtype)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -203,10 +201,7 @@ class TTXGemmReduceScatter(MojoGemmReduceScatter):
         self._rank = runtime.rank
         self._world_size = runtime.world_size
 
-        BLOCK_SIZE_M, BLOCK_SIZE_N = 128, 256
-        ncore = get_num_cores("cube")
-        pvalue, buffer_num = 4, 2
-        flat_size = BLOCK_SIZE_M * pvalue * ncore * buffer_num * BLOCK_SIZE_N
+        flat_size = gemm_reduce_scatter_peer_mem_size()
         self._peer_mem = runtime.allocate_peer_mem(flat_size, dtype)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:

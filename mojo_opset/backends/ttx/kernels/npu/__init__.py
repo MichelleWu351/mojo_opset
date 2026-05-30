@@ -52,13 +52,16 @@ from .swiglu import swiglu_fwd_impl
 
 # triton-dist based comm kernels (requires triton_dist + shmem packages)
 allgather_gemm_impl = None
+allgather_gemm_peer_mem_size = None
 gemm_allreduce_impl = None
+gemm_allreduce_peer_mem_size = None
 gemm_reduce_scatter_impl = None
+gemm_reduce_scatter_peer_mem_size = None
 try:
     import triton_dist  # noqa: F401 — gate on the actual optional dependency
-    from .allgather_gemm import allgather_gemm_impl
-    from .gemm_allreduce import gemm_allreduce_impl
-    from .gemm_reduce_scatter import gemm_reduce_scatter_impl
+    from .allgather_gemm import allgather_gemm_impl, allgather_gemm_peer_mem_size
+    from .gemm_allreduce import gemm_allreduce_impl, gemm_allreduce_peer_mem_size
+    from .gemm_reduce_scatter import gemm_reduce_scatter_impl, gemm_reduce_scatter_peer_mem_size
 except ImportError:
     import logging
     logging.getLogger(__name__).debug("triton_dist not available, comm kernels disabled")

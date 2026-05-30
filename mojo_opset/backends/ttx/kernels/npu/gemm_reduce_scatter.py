@@ -187,3 +187,11 @@ def gemm_reduce_scatter_impl(
         pvalue, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
         COMM_BLOCK_SIZE_M, COMM_BLOCK_SIZE_N, input.dtype == torch.bfloat16,
     )
+
+
+def gemm_reduce_scatter_peer_mem_size() -> int:
+    """Return the flat peer_mem element count required for gemm_reduce_scatter kernel."""
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 128, 256
+    ncore = get_num_cores("cube")
+    pvalue, buffer_num = 4, 2
+    return BLOCK_SIZE_M * pvalue * ncore * buffer_num * BLOCK_SIZE_N
