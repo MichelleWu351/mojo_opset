@@ -14,7 +14,8 @@ from mojo_opset.core import MojoGemmReduceScatter
 from mojo_opset.runtime import MojoSymmetricMemoryManager
 
 
-_TTX_SHMEM_SIZE_MB = int(os.environ.get("MOJO_TTX_SHMEM_SIZE_MB", "1024"))
+def _get_ttx_shmem_size_mb():
+    return int(os.environ.get("MOJO_TTX_SHMEM_SIZE_MB", "1024"))
 
 
 class TTXAllGatherGemm(MojoAllGatherGemm):
@@ -42,7 +43,7 @@ class TTXAllGatherGemm(MojoAllGatherGemm):
         runtime = MojoSymmetricMemoryManager.get_or_create(
             process_group=self.process_group,
             backend="ttx",
-            shmem_heap_size_mb=_TTX_SHMEM_SIZE_MB,
+            shmem_heap_size_mb=_get_ttx_shmem_size_mb(),
         )
         runtime.get_backend_manager()
 
@@ -122,7 +123,7 @@ class TTXGemmAllReduce(MojoGemmAllReduce):
         runtime = MojoSymmetricMemoryManager.get_or_create(
             process_group=self.process_group,
             backend="ttx",
-            shmem_heap_size_mb=_TTX_SHMEM_SIZE_MB,
+            shmem_heap_size_mb=_get_ttx_shmem_size_mb(),
         )
         runtime.get_backend_manager()
 
@@ -195,7 +196,7 @@ class TTXGemmReduceScatter(MojoGemmReduceScatter):
         runtime = MojoSymmetricMemoryManager.get_or_create(
             process_group=self.process_group,
             backend="ttx",
-            shmem_heap_size_mb=_TTX_SHMEM_SIZE_MB,
+            shmem_heap_size_mb=_get_ttx_shmem_size_mb(),
         )
         runtime.get_backend_manager()
 

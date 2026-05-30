@@ -50,16 +50,18 @@ from .swa import swa_paged_prefill_impl
 from .swiglu import swiglu_bwd_impl
 from .swiglu import swiglu_fwd_impl
 
-# triton-dist based comm kernels — optional dependency
+# triton-dist based comm kernels (requires triton_dist + shmem packages)
 allgather_gemm_impl = None
 gemm_allreduce_impl = None
 gemm_reduce_scatter_impl = None
 try:
+    import triton_dist  # noqa: F401 — gate on the actual optional dependency
     from .allgather_gemm import allgather_gemm_impl
     from .gemm_allreduce import gemm_allreduce_impl
     from .gemm_reduce_scatter import gemm_reduce_scatter_impl
 except ImportError:
-    pass
+    import logging
+    logging.getLogger(__name__).debug("triton_dist not available, comm kernels disabled")
 
 # Over-Encoding (OE)
 from .over_encoding.embedding import embedding_nf4_dequant_impl

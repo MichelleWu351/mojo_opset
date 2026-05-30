@@ -23,6 +23,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+pytest.importorskip("triton_dist", reason="requires triton-dist package")
+
 from mojo_opset import MojoAllGatherGemm
 from mojo_opset import MojoGemmAll2All
 from mojo_opset import MojoGemmAllReduce
@@ -125,8 +127,6 @@ def _dist_all_gather_gemm():
     dist.destroy_process_group()
 
 
-# TODO: Remove skip once triton-dist is added to mojo CI dependencies
-@pytest.mark.skip(reason="requires triton-dist which is not yet in CI")
 def test_all_gather_gemm_comm():
     if _is_dist_env():
         _dist_all_gather_gemm()
@@ -166,8 +166,6 @@ def _dist_gemm_all_reduce():
     dist.destroy_process_group()
 
 
-# TODO: Remove skip once triton-dist is added to mojo CI dependencies
-@pytest.mark.skip(reason="requires triton-dist which is not yet in CI")
 def test_gemm_all_reduce_comm():
     if _is_dist_env():
         _dist_gemm_all_reduce()
@@ -207,8 +205,6 @@ def _dist_gemm_reduce_scatter():
     dist.destroy_process_group()
 
 
-# TODO: Remove skip once triton-dist is added to mojo CI dependencies
-@pytest.mark.skip(reason="requires triton-dist which is not yet in CI")
 def test_gemm_reduce_scatter_comm():
     if _is_dist_env():
         _dist_gemm_reduce_scatter()
@@ -248,8 +244,6 @@ def _dist_gemm_all2all():
     dist.destroy_process_group()
 
 
-# TODO: Remove skip once triton-dist is added to mojo CI dependencies
-@pytest.mark.skip(reason="requires triton-dist which is not yet in CI")
 def test_gemm_all2all_comm():
     if _is_dist_env():
         _dist_gemm_all2all()
@@ -291,8 +285,6 @@ def _dist_parallel_embedding():
     dist.destroy_process_group()
 
 
-# TODO: Remove skip once triton-dist is added to mojo CI dependencies
-@pytest.mark.skip(reason="requires triton-dist which is not yet in CI")
 def test_parallel_embedding_comm():
     if _is_dist_env():
         _dist_parallel_embedding()
