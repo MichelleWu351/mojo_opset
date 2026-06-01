@@ -30,6 +30,7 @@ from .operators.normalization import MojoChannelRMSNorm
 from .operators.normalization import MojoGroupLayerNorm
 from .operators.position_embedding import MojoGridRoPE
 from .operators.position_embedding import MojoRelativeEmbedding
+from .operators.fused_norm_rope_quant_store import MojoFusedNormRoPEQuantStore
 from .operators.store_lowrank import MojoStoreLowrank
 
 __all__ = [
@@ -60,5 +61,6 @@ __all__ = [
     "MojoRelativeEmbedding",
     "MojoGridRoPE",
     "MojoStoreLowrank",
+    "MojoFusedNormRoPEQuantStore",
     "MojoIndexer",
 ]
