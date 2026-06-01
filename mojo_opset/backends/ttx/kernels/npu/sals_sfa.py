@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -265,6 +266,11 @@ def _gather_kv_to_wksp(
                 phys_pages = tl.load(
                     block_tables_ptr + qid * stride_bt_req + page_ids * stride_bt_blk,
                 )
+                # FIX (Bug #3, exception 507015 on cbs>=256):
+                # 当 cbs 大时 stride_kc_blk = cbs*kvH*D 容易让 phys_pages*stride 越过 int32 范围。
+                # 例如 12B w4_all_512 模型 kvH=8 + cbs=512 时 stride=524288，phys_pages>=4096 即溢出。
+                # 提前 cast 到 int64 强制 64-bit 地址生成，cbs=64 路径完全无影响。
+                phys_pages = phys_pages.to(tl.int64)
                 valid_pages = phys_pages >= 0
                 ws_offs_token = j * sparse_block_size + offs_sbs
                 tl.store(
@@ -286,9 +292,11 @@ def _gather_kv_to_wksp(
                 k_vals = tl.load(K_cache_ptr + k_offset, mask=combined_mask)
                 v_vals = tl.load(V_cache_ptr + v_offset, mask=combined_mask)
                 if HAS_KSCALES:
-                    k_vals = (k_vals.to(tl.float32) * k_scale).to(k_vals.dtype)
+                    # Workaround: 当 K cache 是 int8 时不能 cast 回 k_vals.dtype（会 cast 回 int8 丢精度）
+                    # 必须 cast 到 workspace 的 dtype（一般是 q.dtype = bf16/fp16）
+                    k_vals = (k_vals.to(tl.float32) * k_scale).to(Wksp_K_ptr.dtype.element_ty)
                 if HAS_VSCALES:
-                    v_vals = (v_vals.to(tl.float32) * v_scale).to(v_vals.dtype)
+                    v_vals = (v_vals.to(tl.float32) * v_scale).to(Wksp_V_ptr.dtype.element_ty)
                 tl.store(
                     Wksp_K_ptr + wk_base_k + ws_offs_token[:, None] * stride_wk_kv
                     + offs_d[None, :] * stride_wk_d, k_vals,
@@ -351,8 +359,9 @@ def _sals_sfa_fwd_kernel(
                 use_dense = tl.load(group_use_dense_ptr + group)
                 should_process = should_process & (use_dense != 1)
             q_end = q_start + q_len
-            if q_end > T:
-                q_end = T
+            # 用 tl.minimum 替代 if-else，避免 triton 在 then 分支重新推断类型为 int64
+            # （原来的 q_end = T 会让 q_end 在 then 分支变成 int64，与 else 分支 int32 不一致）
+            q_end = tl.minimum(q_end, T.to(q_end.dtype))
             actual_q_len = q_end - q_start
             should_process = should_process & (actual_q_len > 0)
             req_start = tl.load(cumsum_q_len_ptr + qid)
@@ -534,11 +543,23 @@ def sals_sfa_impl(
         cache_block_size = k_cache.shape[1]
 
     g_ratio = num_query_heads // num_kv_heads
-    BLOCK_Q = 64
+    # 端到端 12B 模型 KV_BLOCK_SIZE=512，BLOCK_Q=64 + cache_block_size=512 + tile_mix=4 会 UB overflow（2.02M > 1.5M）
+    # 0531: BLOCK_Q=128 在 cbs=512 跑通但有时 hang，保守用 BQ=64 default;  MOJO_SFA_BLOCK_Q=128 可以 opt-in
+    _env_block_q = os.getenv("MOJO_SFA_BLOCK_Q", "")
+    if _env_block_q:
+        BLOCK_Q = int(_env_block_q)
+    elif cache_block_size >= 256:
+        BLOCK_Q = 64
+    else:
+        BLOCK_Q = 64
     if sparse_block_size >= 128:
         BLOCK_RS2 = 2
     elif sparse_block_size >= 64:
-        BLOCK_RS2 = 4
+        # FIX (Bug #0): sbs=64 + recent=4 时 AICore mte load2d 越界（与 BLOCK_RS2 == recent 的某种
+        # tile-pipeline edge case 有关）。默认从 4 降到 2 完全规避，但允许 env var 强制覆盖
+        # （比如已知 recent != 4 的部署场景可设 MOJO_SFA_BLOCK_RS2=4 拿回 ~50% 单算子吞吐）。
+        _env_block_rs2 = os.getenv("MOJO_SFA_BLOCK_RS2", "")
+        BLOCK_RS2 = int(_env_block_rs2) if _env_block_rs2 else 2
     else:
         BLOCK_RS2 = 8
 
@@ -554,7 +575,7 @@ def sals_sfa_impl(
     wksp_count = prog_num
     workspace_k = torch.empty((wksp_count, max_kv_tokens, head_dim), dtype=wk_dtype, device=device)
     workspace_v = torch.empty((wksp_count, max_kv_tokens, head_dim), dtype=wk_dtype, device=device)
-    workspace_pos = torch.full((wksp_count, max_kv_tokens), -1,dtype=torch.int32, device=device)
+    workspace_pos = torch.full((wksp_count, max_kv_tokens), -1, dtype=torch.int32, device=device)
 
     if k_scales is None:
         k_scales = torch.empty(0, dtype=torch.float32, device=device)
@@ -616,11 +637,19 @@ def sals_sfa_impl(
         HAS_USEDENSE=group_use_dense.numel() > 0,
         BLOCK_Q=BLOCK_Q, BLOCK_RS2=BLOCK_RS2,
         multibuffer=True,
-        enable_ubuf_saving=True,
-        #unit_flag=True, 
+        # FIX (Bug #3, exception 507015): cbs >= 256 时 enable_ubuf_saving=True
+        # + set_workspace_multibuffer=4 + tile_mix_vector_loop=4 联合让 BiSheng
+        # 把 4 次 gather load 合并成 [256, head_dim] 的大 strided load，UB 在 runtime
+        # 时序复用假设失效。降级到 multibuffer=2，cbs<256 时仍走 4。
+        # FIX (Bug #3-extra, exception 507035 DDR MTE out of range): 长 q (q>=64k) +
+        # cbs=512 时 enable_ubuf_saving=True 仍偶发 DDR MTE 越界。设
+        # MOJO_SFA_DISABLE_UBUF_SAVING=1 强制关掉（端到端长序列推荐打开），单算子 cbs=512
+        # q=32k 默认走 enable_ubuf_saving=True（性能更好）。
+        enable_ubuf_saving=(False if os.getenv("MOJO_SFA_DISABLE_UBUF_SAVING", "0") == "1" else True),
+        #unit_flag=True,
         limit_auto_multi_buffer_only_for_local_buffer=False,
-        set_workspace_multibuffer=4, 
-        tile_mix_vector_loop=4,
-        tile_mix_cube_loop=4,
+        set_workspace_multibuffer=int(os.getenv("MOJO_SFA_MULTIBUFFER", "0")) if os.getenv("MOJO_SFA_MULTIBUFFER", "0") != "0" else (2 if cache_block_size >= 256 else 4),
+        tile_mix_vector_loop=int(os.getenv("MOJO_SFA_TILE_MIX", "0")) if os.getenv("MOJO_SFA_TILE_MIX", "0") != "0" else (2 if cache_block_size >= 256 else 4),
+        tile_mix_cube_loop=int(os.getenv("MOJO_SFA_TILE_CUBE", "4")),
     )
     return output

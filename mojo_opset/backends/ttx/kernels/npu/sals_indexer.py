@@ -94,9 +94,11 @@ def sals_indexer_kernel(
                             token_pos = block_start + offs_sbs
                             page_ids = token_pos // CBS
                             page_offsets = token_pos - page_ids * CBS
+                            # FIX: 与 sals_sfa.py 一致，强制 int64 防 phys_id*stride_kblk 溢出
+                            # 端到端 q=64k cbs=512 时此处会 DDR MTE 越界 (error 0x800000)
                             phys_id = tl.load(
                                 block_table_ptr + g * stride_btg + page_ids * stride_btt
-                            ).to(tl.int32)
+                            ).to(tl.int64)
                             valid_page = phys_id >= 0
 
                             # K[phys_id, :, n, :] → [SBS, D]

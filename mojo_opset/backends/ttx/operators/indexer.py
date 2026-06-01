@@ -84,7 +84,10 @@ class TTXSALSIndexer(MojoSALSIndexer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         query = query.contiguous()
         key = key.contiguous()
-        block_table = block_table.contiguous()
+        # FIX (Bug q=64k indexer DDR MTE): 强制 block_table 为 int32，
+        # 避免端到端 multi-rank 路径下 int64 block_table 触发 BiSheng UB liveness 误判
+        # （与 sals_sfa.py 同样的问题，但 indexer 这边没有 enable_ubuf_saving 开关）。
+        block_table = block_table.to(torch.int32).contiguous()
         actual_seq_lengths_key = actual_seq_lengths_key.contiguous()
         act_n_counts = act_n_counts.contiguous()
 

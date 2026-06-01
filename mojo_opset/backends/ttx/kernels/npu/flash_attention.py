@@ -1,6 +1,10 @@
 import math
+import os
 
 from typing import Optional
+
+# Module-level cache for aux_mask
+_CACHED_AUX_MASK_KVDQ = None
 
 import torch
 import triton
@@ -741,12 +745,24 @@ def paged_attention_prefill_with_kv_dequant_impl(
     if block_tables_i32 is None:
         block_tables_i32 = block_tables.to(torch.int32)
 
-    aux_mask = torch.ones(1024, 1024 * 3, dtype=torch.bool).tril(1024).npu()
+    # OPT (0531): cache aux_mask 避免每次调用都重建 + host->device 拷贝（~3MB bool tensor）
+    global _CACHED_AUX_MASK_KVDQ
+    if "_CACHED_AUX_MASK_KVDQ" not in globals() or _CACHED_AUX_MASK_KVDQ is None:
+        _CACHED_AUX_MASK_KVDQ = torch.ones(1024, 1024 * 3, dtype=torch.bool).tril(1024).npu()
+    aux_mask = _CACHED_AUX_MASK_KVDQ
 
     o = out
 
     CHUNK_SIZE = 64 if head_dim > 128 else 128
-    BLOCK_SIZE_N = min(64, triton.next_power_of_2(block_size))
+    # OPT: 0531 — q=32k 工况下默认 BLOCK_N=64 让 256 q-blocks 串行在 24 cube 上慢；
+    # BLOCK_N=128 让 KV cube 利用率提升 1.8× (32ms → 17.6ms 单算子 q=32k qH=2 kvH=1 bs=512)
+    _env_block_m = os.getenv("MOJO_TTX_GQA_BLOCK_M", "")
+    if _env_block_m:
+        CHUNK_SIZE = int(_env_block_m)
+    BLOCK_SIZE_N = min(128, triton.next_power_of_2(block_size))
+    _env_block_n = os.getenv("MOJO_TTX_GQA_BLOCK_N", "")
+    if _env_block_n:
+        BLOCK_SIZE_N = int(_env_block_n)
     cube_num = get_num_cores("cube")
     grid = (cube_num,)
 
@@ -780,11 +796,11 @@ def paged_attention_prefill_with_kv_dequant_impl(
         BLOCK_SIZE_M=CHUNK_SIZE,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_D=head_dim,
-        enable_ubuf_saving=True,
+        enable_ubuf_saving=(os.getenv("MOJO_TTX_GQA_UBUF", "1") == "1"),
         limit_auto_multi_buffer_only_for_local_buffer=False,
-        set_workspace_multibuffer=4,
-        tile_mix_vector_loop=4,
-        tile_mix_cube_loop=4,
+        set_workspace_multibuffer=int(os.getenv("MOJO_TTX_GQA_MB", "4")),
+        tile_mix_vector_loop=int(os.getenv("MOJO_TTX_GQA_TM_V", "4")),
+        tile_mix_cube_loop=int(os.getenv("MOJO_TTX_GQA_TM_C", "4")),
     )
 
     return o

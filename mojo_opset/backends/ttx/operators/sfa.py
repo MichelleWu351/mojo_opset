@@ -31,6 +31,10 @@ class TTXSALSSFA(MojoSALSSFA):
         head_dim: int,
         sparse_block_size: int,
     ) -> torch.Tensor:
+        # FIX (Bug q=64k indexer DDR MTE): 强制 block_tables 为 int32，与单算子测试统一，
+        # 避免端到端 int64 block_tables 触发 BiSheng codegen 在长 q + cbs=512 时越界。
+        if block_tables.dtype != torch.int32:
+            block_tables = block_tables.to(torch.int32)
         return sals_sfa_impl(
             q, k_cache, v_cache, k_scales, v_scales,
             block_tables, indices_flat, seq_len_flat,
