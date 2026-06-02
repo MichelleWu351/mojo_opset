@@ -244,8 +244,9 @@ def verify_mtp_spec_tokens(mtp_spec_tokens, all_logits, next_n, *, sync_tokens=F
         dist.broadcast(main_greedy, src=0, group=group)
 
     token_mask = mtp_spec_tokens == main_greedy[:, :next_n]
-    has_invalid = (token_mask == False).any(dim=-1)
-    invalid_pos = (token_mask == False).int().argmax(dim=-1)
+    invalid_mask = ~token_mask
+    has_invalid = invalid_mask.any(dim=-1)
+    invalid_pos = invalid_mask.int().argmax(dim=-1)
     accepted_num = torch.where(has_invalid, invalid_pos, token_mask.shape[-1])
     if sync_tokens:
         accepted_num = accepted_num.contiguous()
@@ -272,7 +273,7 @@ def mtp_post_process(
     allow_decode_graph=True,
     initial_decode_input_ids=None,
 ):
-    mtp_spec_tokens = None
+    mtp_spec_tokens_list = []
     if initial_decode_input_ids is None:
         mtp_decode_input_ids = mtp_generate_ids[:, -spec_len:].contiguous().reshape(batch_size, spec_len)
     else:
@@ -309,7 +310,7 @@ def mtp_post_process(
                     mtp_decode_graph_warmed = True
 
         mtp_spec_token = sample_last_token(mtp_logits)
-        mtp_spec_tokens = mtp_spec_token if mtp_spec_tokens is None else torch.cat([mtp_spec_tokens, mtp_spec_token], dim=-1)
+        mtp_spec_tokens_list.append(mtp_spec_token)
         mtp_prev_hidden = mtp_hidden[:, -spec_len:, :].contiguous().reshape(batch_size, spec_len, -1)
         mtp_generate_ids = torch.cat([mtp_generate_ids, mtp_spec_token], dim=-1)
         mtp_decode_input_ids = torch.cat(
@@ -317,6 +318,7 @@ def mtp_post_process(
             dim=-1,
         ).contiguous().reshape(batch_size, spec_len)
 
+    mtp_spec_tokens = torch.cat(mtp_spec_tokens_list, dim=-1)
     return mtp_spec_tokens, mtp_prev_hidden, mtp_generate_ids, mtp_decode_graph_warmed, mtp_decode_graph_warmed_steps
 
 
@@ -452,12 +454,12 @@ def update_mtp_after_verify(
     sync_tokens=False,
     moe_ep_group=None,
 ):
-    for row in range(batch_size):
-        cur_accepted = accepted_num[row].item() + 1
-        for j in range(cur_accepted):
-            generated[row].append(int(main_greedy[row, j].item()))
+    accepted_num_cpu = accepted_num.detach().cpu().tolist()
+    main_greedy_cpu = main_greedy[:, :spec_len].detach().cpu().tolist()
+    for row, accepted in enumerate(accepted_num_cpu):
+        generated[row].extend(int(token) for token in main_greedy_cpu[row][:accepted + 1])
 
-    accepted_step = (1 + accepted_num.unsqueeze(0)).squeeze(0)
+    accepted_step = accepted_num + 1
     if next_n == 1:
         runtime_state.paged_cache.seq_lens += accepted_step
     elif main_seq_lens_before_verify is not None:
@@ -465,32 +467,42 @@ def update_mtp_after_verify(
     else:
         runtime_state.paged_cache.seq_lens += accepted_step
 
-    next_token_id = torch.stack(
-        [main_greedy[row, accepted_num[row].item()] for row in range(batch_size)], dim=0
-    ).unsqueeze(-1)
+    accepted_idx = accepted_num.to(dtype=torch.long).view(batch_size, 1)
+    next_token_id = main_greedy.gather(1, accepted_idx)
     if sync_tokens:
         next_token_id = next_token_id.contiguous()
         dist.broadcast(next_token_id, src=0, group=moe_ep_group)
 
-    mtp_prev_hidden_list = []
-    confirmed_generate_ids_list = []
-    for row in range(batch_size):
-        cur_len = accepted_num[row].item() + 1
-        cur_accepted_hidden = main_hidden[row, :cur_len, :].unsqueeze(0)
-        mtp_prev_hid = torch.cat([confirmed_prev_hidden[row:row+1], cur_accepted_hidden], dim=1)[:, -spec_len:, :]
-        mtp_prev_hidden_list.append(mtp_prev_hid)
-        cur_accepted_ids = main_greedy[row, :cur_len]
-        confirmed_generate_ids_list.append(torch.cat([confirmed_generate_ids[row], cur_accepted_ids]))
-    mtp_prev_hidden = torch.cat(mtp_prev_hidden_list, dim=0).reshape(batch_size, spec_len, -1)
+    hidden_dim = main_hidden.shape[-1]
+    hidden_positions = (
+        accepted_step.to(dtype=torch.long).view(batch_size, 1, 1) +
+        torch.arange(spec_len, device=main_hidden.device, dtype=torch.long).view(1, spec_len, 1)
+    ).expand(batch_size, spec_len, hidden_dim)
+    mtp_prev_hidden = torch.gather(
+        torch.cat([confirmed_prev_hidden, main_hidden[:, :spec_len, :]], dim=1),
+        dim=1,
+        index=hidden_positions,
+    ).contiguous().reshape(batch_size, spec_len, hidden_dim)
     confirmed_prev_hidden = mtp_prev_hidden
 
-    from torch.nn.utils.rnn import pad_sequence
-    confirmed_generate_ids_rev = [ids.flip(0) for ids in confirmed_generate_ids_list]
-    confirmed_generate_ids = pad_sequence(
-        confirmed_generate_ids_rev,
-        batch_first=True,
-        padding_value=pad_token_id,
-    ).flip(1).contiguous()
+    old_history_len = confirmed_generate_ids.shape[1]
+    new_history_len = old_history_len + spec_len
+    history_pad = torch.full(
+        (batch_size, spec_len),
+        pad_token_id,
+        dtype=confirmed_generate_ids.dtype,
+        device=confirmed_generate_ids.device,
+    )
+    history_source = torch.cat([history_pad, confirmed_generate_ids, history_pad], dim=1)
+    new_col_idx = torch.arange(new_history_len, device=confirmed_generate_ids.device, dtype=torch.long).view(1, new_history_len)
+    old_shift_idx = accepted_step.to(dtype=torch.long).view(batch_size, 1) + new_col_idx
+    shifted_history = history_source.gather(1, old_shift_idx.expand(batch_size, new_history_len))
+    append_start = new_history_len - accepted_step.to(dtype=torch.long).view(batch_size, 1)
+    append_idx = new_col_idx - append_start
+    valid_append = append_idx >= 0
+    append_idx = append_idx.clamp(min=0, max=spec_len - 1).expand(batch_size, new_history_len)
+    append_tokens = main_greedy[:, :spec_len].gather(1, append_idx)
+    confirmed_generate_ids = torch.where(valid_append, append_tokens, shifted_history).contiguous()
 
     mtp_runtime_state.paged_cache.seq_lens.copy_(mtp_seq_lens_cached + 1 + accepted_num)
     mtp_seq_lens_cached = mtp_runtime_state.paged_cache.seq_lens.clone()
@@ -803,7 +815,6 @@ def forward_mtp_cp_prefill_minibatch_mojo(
     return torch.cat(logits_chunks, dim=0), past_key_values, torch.cat(hidden_chunks, dim=0)
 
 
-
 def forward_main_decode_mojo(
     model,
     token_ids,
@@ -831,7 +842,14 @@ def forward_main_decode_mojo(
         prepare_kwargs = {}
         if expected_seq_len is not None:
             prepare_kwargs["expected_seq_len"] = expected_seq_len
-        decode_meta = runtime_state.prepare_decode_inputs(token_ids, **prepare_kwargs)
+        decode_meta = runtime_state.prepare_decode_inputs(
+            token_ids,
+            allow_decode_fast_path=(
+                token_ids.shape[1] == 1 or
+                expected_seq_len is not None
+            ),
+            **prepare_kwargs,
+        )
         attn_metadata = decode_meta.get("attn_metadata") if use_attn_metadata else None
 
         if decode_fn is not None:
@@ -876,7 +894,7 @@ def forward_mtp_decode_mojo(
     This is intentionally separate from main decode: the MTP model consumes the
     previous main/MTP hidden states and advances its own draft cache.
     """
-    decode_meta = runtime_state.prepare_decode_inputs(input_ids)
+    decode_meta = runtime_state.prepare_decode_inputs(input_ids, allow_decode_fast_path=True)
     attn_metadata = decode_meta.get("attn_metadata")
 
     if decode_fn is not None:
@@ -1199,7 +1217,7 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
         input_ids = next_token_id
 
     warmup_steps = int(os.getenv("MOJO_PROF_WARMUP_STEPS", "3"))
-    prof_steps = int(os.getenv("MOJO_PROF_ACTIVE_STEPS", "3"))
+    prof_steps = int(os.getenv("MOJO_PROF_ACTIVE_STEPS", "10"))
     prof_active = False
     prof_ctx = None
     try:
@@ -1215,7 +1233,7 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
                     schedule=prof_mod.schedule(wait=0, warmup=0, active=prof_steps, repeat=1),
                     on_trace_ready=prof_mod.tensorboard_trace_handler(prof_dir),
                     record_shapes=True,
-                    with_stack=True,
+                    with_stack=False,
                     with_flops=True,
                 )
                 prof_ctx.__enter__()

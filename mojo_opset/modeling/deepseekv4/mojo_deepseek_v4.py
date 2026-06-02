@@ -504,6 +504,32 @@ class PagedDummyCache:
             torch.zeros_like(block_table_offset[:start_pos.shape[0]]),
         )
 
+    def get_cmp_state_block_table_decode_window(
+        self,
+        layer_idx: int,
+        start_pos: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        ratio = self.config.compress_ratios[layer_idx]
+        block_table_offset = self._state_block_table_offsets.get(ratio)
+        block_pos_ids = self._state_block_pos_ids.get(ratio)
+        if block_table_offset is None or block_pos_ids is None:
+            seq_used_q = torch.full((start_pos.shape[0],), seq_len, dtype=torch.int32, device=start_pos.device)
+            return self.get_cmp_state_block_table(layer_idx, start_pos, seq_used_q, False)
+
+        batch_size = start_pos.shape[0]
+        start_pos = start_pos.to(dtype=torch.int32)
+        actual_block_start = (start_pos // self.block_size).view(batch_size, 1)
+        actual_block_end = ((start_pos + seq_len - 1) // self.block_size).view(batch_size, 1)
+        block_pos_ids = block_pos_ids[:batch_size]
+        block_table_offset = block_table_offset[:batch_size]
+        block_table = torch.where(
+            block_pos_ids >= actual_block_start,
+            block_table_offset,
+            torch.zeros_like(block_table_offset),
+        )
+        return torch.where(block_pos_ids <= actual_block_end, block_table, torch.zeros_like(block_table))
+
     def get_compressed_position_ids(
         self,
         start_pos: torch.Tensor,
@@ -547,6 +573,38 @@ class PagedDummyCache:
         packed_idx = (torch.cumsum(compressed_len, dim=0, dtype=torch.int32) - 1).to(torch.long)
         position_ids_cmp[packed_idx[valid_mask]] = cmp_start[valid_mask]
         return compressed_len, position_ids_cmp
+
+    def get_compressed_position_ids_decode_window(
+        self,
+        start_pos: torch.Tensor,
+        seq_len: int,
+        ratio: int,
+        pad_value: int = 1,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        start_pos = start_pos.to(dtype=torch.int32)
+        batch_size = start_pos.shape[0]
+        total_q_len = batch_size * seq_len
+        max_len = min(total_q_len, total_q_len // ratio + batch_size)
+        if max_len <= 0:
+            return (
+                torch.zeros((batch_size,), dtype=torch.int32, device=start_pos.device),
+                torch.empty((0,), dtype=torch.int32, device=start_pos.device),
+            )
+
+        cmp_start = start_pos // ratio
+        cmp_end = (start_pos + seq_len) // ratio
+        compressed_len = cmp_end - cmp_start
+        offsets = F.pad(torch.cumsum(compressed_len, dim=0, dtype=torch.int32), (1, 0))[:-1]
+        out_idx = torch.arange(max_len, dtype=torch.int32, device=start_pos.device).view(1, max_len)
+        valid_by_row = (out_idx >= offsets.view(batch_size, 1)) & (
+            out_idx < (offsets + compressed_len).view(batch_size, 1)
+        )
+        any_valid = valid_by_row.any(dim=0)
+        row_idx = valid_by_row.to(dtype=torch.int32).argmax(dim=0).to(torch.long)
+        rel_idx = out_idx.view(max_len) - offsets[row_idx]
+        compressed_ids = cmp_start[row_idx] + rel_idx
+        pad_ids = torch.full((max_len,), pad_value, dtype=torch.int32, device=start_pos.device)
+        return compressed_len, torch.where(any_valid, compressed_ids.to(dtype=torch.int32), pad_ids)
 
     def get_cmp_slot_mapping(
         self,
@@ -613,6 +671,40 @@ class PagedDummyCache:
         slot_mapping[packed_idx[valid_mask]] = slots[valid_mask].to(dtype=torch.int32)
         return slot_mapping
 
+    def get_cmp_slot_mapping_decode_window(
+        self,
+        layer_idx: int,
+        start_pos: torch.Tensor,
+        seq_len: int,
+        compressed_len: Optional[torch.Tensor] = None,
+        position_ids_cmp: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        ratio = self.config.compress_ratios[layer_idx]
+        block_table = self.cache_data[layer_idx].get(f"c{ratio}a_cmp_kv_block_table")
+        if block_table is None:
+            return None
+        if compressed_len is None or position_ids_cmp is None:
+            compressed_len, position_ids_cmp = self.get_compressed_position_ids_decode_window(start_pos, seq_len, ratio)
+
+        total_len = position_ids_cmp.shape[0]
+        if total_len == 0:
+            return torch.empty((0,), dtype=torch.int32, device=start_pos.device)
+
+        batch_size = start_pos.shape[0]
+        offsets = F.pad(torch.cumsum(compressed_len, dim=0, dtype=torch.int32), (1, 0))[:-1]
+        out_idx = torch.arange(total_len, dtype=torch.int32, device=start_pos.device).view(1, total_len)
+        valid_by_row = (out_idx >= offsets.view(batch_size, 1)) & (
+            out_idx < (offsets + compressed_len).view(batch_size, 1)
+        )
+        any_valid = valid_by_row.any(dim=0)
+        row_idx = valid_by_row.to(dtype=torch.int32).argmax(dim=0).to(torch.long)
+        indices = position_ids_cmp.to(dtype=torch.int32)
+        block_idx = (indices // self.block_size).to(torch.long)
+        offset = indices % self.block_size
+        slots = block_table[:batch_size][row_idx, block_idx] * self.block_size + offset
+        invalid_slots = torch.full((total_len,), -1, dtype=torch.int32, device=start_pos.device)
+        return torch.where(any_valid, slots.to(dtype=torch.int32), invalid_slots)
+
     def get_compressed_rope_position_ids(
         self,
         start_pos: torch.Tensor,
@@ -662,6 +754,20 @@ class PagedDummyCache:
         offset = start_pos % self.block_size
         row_idx = self._batch_indices_long[:batch_size]
         return (block_table[row_idx, block_idx] * self.block_size + offset).to(dtype=torch.int32)
+
+    def get_win_slot_mapping_decode_window(self, start_pos: torch.Tensor, seq_len: int) -> torch.Tensor:
+        start_pos = start_pos.to(device=self.device, dtype=torch.int32)
+        batch_size = start_pos.shape[0]
+        if seq_len <= 0 or batch_size == 0:
+            return torch.empty((0,), dtype=torch.int32, device=self.device)
+
+        block_table = self._get_win_block_table(batch_size)
+        offsets_in_seq = torch.arange(seq_len, dtype=torch.int32, device=self.device).unsqueeze(0)
+        positions = start_pos.unsqueeze(1) + offsets_in_seq
+        block_idx = (positions // self.block_size).to(torch.long)
+        block_offset = positions % self.block_size
+        row_idx = self._batch_indices_long[:batch_size].unsqueeze(1).expand_as(block_idx)
+        return (block_table[row_idx, block_idx] * self.block_size + block_offset).reshape(-1).to(dtype=torch.int32)
 
     def get_full_kv_gather_indices(
         self,
