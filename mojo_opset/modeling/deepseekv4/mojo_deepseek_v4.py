@@ -151,7 +151,9 @@ class _ProfileTimer:
         return False
 
 
-def _profile_timer(layer_idx: int, name: str) -> _ProfileTimer:
+def _profile_timer(layer_idx: int, name: str):
+    if not _DSV4_LAYER_PROFILE:
+        return nullcontext()
     return _ProfileTimer(layer_idx, name)
 
 
@@ -1569,6 +1571,7 @@ class DeepseekV4Attention(nn.Module):
         slot_mapping = attn_metadata.get("slot_mapping", {})
         kernel_metadata = attn_metadata.get("kernel_metadata", {})
         position_ids_c = attn_metadata.get("position_ids_c", {})
+        prefill_kv = attn_metadata.get("prefill_kv") or {}
 
         def prefer_metadata(value, fallback_key):
             return value if value is not None else layer_inputs.get(fallback_key)
@@ -1589,14 +1592,32 @@ class DeepseekV4Attention(nn.Module):
             win_block_table = prefer_metadata(block_table.get("win_kv"), "win_block_table")
             if win_block_table is None:
                 win_block_table = fallback_win_block_table
+            prefill_win_block_table = prefer_metadata(prefill_kv.get("win_block_table"), "win_block_table")
+            if prefill_win_block_table is None:
+                prefill_win_block_table = win_block_table
+            win_slot_mapping = prefer_metadata(
+                prefill_kv.get("win_slot_mapping")
+                if attn_metadata.get("is_prefill", False)
+                else slot_mapping.get("win_kv"),
+                "win_slot_mapping",
+            )
+            if win_slot_mapping is None:
+                q_lens = attn_metadata["seq_used_q"]
+                start_pos = attn_metadata["start_pos"]
+                if attn_metadata.get("is_prefill", False):
+                    win_slot_mapping = past_key_values.get_win_slot_mapping(start_pos, q_lens)
+                else:
+                    win_slot_mapping = past_key_values.get_win_slot_mapping_decode(start_pos)
             layer_inputs.update({
                 "win_kv_cache": win_kv_cache,
-                "win_block_table": win_block_table,
-                "win_slot_mapping": prefer_metadata(slot_mapping.get("win_kv"), "win_slot_mapping"),
-                "full_kv_cache": prefer_metadata(attn_metadata.get("full_kv_cache"), "full_kv_cache"),
-                "full_block_table": prefer_metadata(block_table.get("full_kv"), "full_block_table"),
-                "full_slot_mapping": prefer_metadata(slot_mapping.get("full_kv"), "full_slot_mapping"),
-                "full_kv_gather_indices": prefer_metadata(slot_mapping.get("full_kv_gather_indices"), "full_kv_gather_indices"),
+                "win_block_table": prefill_win_block_table,
+                "win_slot_mapping": win_slot_mapping,
+                "full_kv_cache": prefer_metadata(prefill_kv.get("full_kv_cache"), "full_kv_cache"),
+                "full_block_table": prefer_metadata(prefill_kv.get("full_block_table"), "full_block_table"),
+                "full_slot_mapping": prefer_metadata(prefill_kv.get("full_slot_mapping"), "full_slot_mapping"),
+                "full_kv_gather_indices": prefer_metadata(prefill_kv.get("full_kv_gather_indices"), "full_kv_gather_indices"),
+                "full_valid_mask": prefer_metadata(prefill_kv.get("full_valid_mask"), "full_valid_mask"),
+                "win_local_indices": prefer_metadata(prefill_kv.get("win_local_indices"), "win_local_indices"),
             })
 
         if self.compress_ratio <= 1:
@@ -1619,6 +1640,22 @@ class DeepseekV4Attention(nn.Module):
             "cmp_slot_mapping": prefer_metadata(slot_mapping.get(cmp_block_key), "cmp_slot_mapping"),
             "cmp_block_tables": prefer_metadata(block_table.get(cmp_block_key), "cmp_block_tables"),
         })
+        if layer_inputs.get("cmp_slot_mapping") is None and past_key_values is not None:
+            layer_inputs["cmp_slot_mapping"] = past_key_values.get_cmp_slot_mapping(
+                self.layer_idx,
+                attn_metadata["start_pos"],
+                attn_metadata["seq_used_q"],
+                cu_seqlens_q=attn_metadata["cu_seq_lens_q"],
+            )
+        if layer_inputs.get("cmp_block_tables") is None and past_key_values is not None:
+            layer_inputs["cmp_block_tables"] = past_key_values.get_cmp_kv_block_table(self.layer_idx)
+        if layer_inputs.get("state_block_table") is None and past_key_values is not None:
+            layer_inputs["state_block_table"] = past_key_values.get_cmp_state_block_table(
+                self.layer_idx,
+                attn_metadata["start_pos"],
+                attn_metadata["seq_used_q"],
+                attn_metadata.get("is_prefill", False),
+            )
 
         if self.compress_ratio == 4 and past_key_values is not None:
             layer_inputs.update({
@@ -1630,6 +1667,10 @@ class DeepseekV4Attention(nn.Module):
                 "li_metadata": prefer_metadata(kernel_metadata.get("lightning_indexer_quant"), "li_metadata"),
                 "c4a_cmp_kv_block_table": prefer_metadata(block_table.get("c4a_cmp_kv"), "c4a_cmp_kv_block_table"),
             })
+            if layer_inputs.get("li_cmp_slot_mapping") is None:
+                layer_inputs["li_cmp_slot_mapping"] = layer_inputs.get("cmp_slot_mapping")
+            if layer_inputs.get("c4a_cmp_kv_block_table") is None:
+                layer_inputs["c4a_cmp_kv_block_table"] = past_key_values.get_c4a_cmp_kv_block_table(self.layer_idx)
 
         return layer_inputs
 
@@ -2143,42 +2184,53 @@ class DeepseekV4Attention(nn.Module):
             o = self._attn_post(o, position_embeddings, attn_inputs=attn_inputs, q_lens=q_lens)
         return o, None
 
-    def _prepare_prefill_ori_kv(
-        self,
-        kv: torch.Tensor,
-        past_key_values: PagedDummyCache,
-        context_lens: torch.Tensor,
-        q_lens: torch.Tensor,
-        attn_inputs: dict,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _update_prefill_full_and_window_kv(self, kv: torch.Tensor, attn_inputs: dict) -> Tuple[torch.Tensor, torch.Tensor]:
         full_kv_cache = attn_inputs.get("full_kv_cache")
         full_block_table = attn_inputs.get("full_block_table")
         full_slot_mapping = attn_inputs.get("full_slot_mapping")
-        if full_kv_cache is None or full_block_table is None or full_slot_mapping is None:
-            kv_cache, block_tables = past_key_values.build_full_kv_for_prefill(
-                kv, context_lens, attn_inputs["cu_q_lens"], actual_q_lens=q_lens
-            )
-        else:
-            token_offsets = torch.arange(kv.shape[1], dtype=torch.int32, device=kv.device).unsqueeze(0)
-            valid_mask = token_offsets < q_lens.unsqueeze(1)
-            kv_flat = kv[valid_mask].reshape(-1, self.head_dim)
-            if kv_flat.numel() > 0:
-                self.scatter_nd_update(
-                    full_kv_cache.view(-1, self.head_dim),
-                    full_slot_mapping.reshape(-1, 1),
-                    kv_flat,
-                )
-            kv_cache = full_kv_cache
-            block_tables = full_block_table
-
+        win_kv_cache = attn_inputs.get("win_kv_cache")
         win_slot_mapping = attn_inputs.get("win_slot_mapping")
-        if win_slot_mapping is None:
-            win_slot_mapping = past_key_values.get_win_slot_mapping(context_lens, q_lens, pad_to_window=True)
-        full_kv_gather_indices = attn_inputs.get("full_kv_gather_indices")
-        if full_kv_gather_indices is None:
-            full_kv_gather_indices = past_key_values.get_full_kv_gather_indices(context_lens, q_lens)
-        past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping, full_kv_gather_indices, context_lens)
-        return kv_cache, block_tables
+        full_valid_mask = attn_inputs.get("full_valid_mask")
+        win_local_indices = attn_inputs.get("win_local_indices")
+
+        required = {
+            "full_kv_cache": full_kv_cache,
+            "full_block_table": full_block_table,
+            "full_slot_mapping": full_slot_mapping,
+            "win_kv_cache": win_kv_cache,
+            "win_slot_mapping": win_slot_mapping,
+            "full_valid_mask": full_valid_mask,
+            "win_local_indices": win_local_indices,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ValueError(
+                "Prefill KV plan is incomplete; missing fields: {}".format(", ".join(missing))
+            )
+
+        kv_flat = kv[full_valid_mask].reshape(-1, self.head_dim)
+        if kv_flat.numel() > 0:
+            self.scatter_nd_update(
+                full_kv_cache.view(-1, self.head_dim),
+                full_slot_mapping.reshape(-1, 1),
+                kv_flat,
+            )
+
+        row_idx = torch.arange(kv.shape[0], device=kv.device, dtype=torch.long).unsqueeze(1).expand_as(win_local_indices)
+        win_kv = kv[row_idx, win_local_indices].reshape(-1, self.head_dim)
+        self.scatter_nd_update(
+            win_kv_cache.view(-1, self.head_dim),
+            win_slot_mapping.reshape(-1, 1),
+            win_kv,
+        )
+        return full_kv_cache, full_block_table
+
+    def _prepare_prefill_ori_kv(
+        self,
+        kv: torch.Tensor,
+        attn_inputs: dict,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._update_prefill_full_and_window_kv(kv, attn_inputs)
 
     def _run_attn(self, q, kv_cache, block_tables, seq_lens, batch_size, seq_length,
                   compress_ratio, cu_q_lens=None, cmp_kv_cache=None, cmp_block_tables=None,
@@ -2241,7 +2293,7 @@ class DeepseekV4Attention(nn.Module):
         if is_prefill:
             with _profile_timer(self.layer_idx, "cache_update"):
                 kv_cache, block_tables = self._prepare_prefill_ori_kv(
-                    kv, past_key_values, context_lens, q_lens, attn_inputs
+                    kv, attn_inputs
                 )
         else:
             kv_flat = kv.reshape(-1, self.head_dim)
@@ -2274,7 +2326,7 @@ class DeepseekV4Attention(nn.Module):
         if is_prefill:
             with _profile_timer(self.layer_idx, "cache_update"):
                 kv_cache, block_tables = self._prepare_prefill_ori_kv(
-                    kv, past_key_values, context_lens, q_lens, attn_inputs
+                    kv, attn_inputs
                 )
         else:
             kv_flat = kv.reshape(-1, self.head_dim)

@@ -437,6 +437,65 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
             "is_prefill": is_prefill,
             "win_kv_cache": win_kv_cache,
             "full_kv_cache": full_kv_cache,
+            "prefill_kv": self._build_prefill_kv_plan(
+                context_lens=context_lens,
+                q_lens=q_lens,
+                batch_size=batch_size,
+                full_kv_cache=full_kv_cache,
+                win_kv_cache=win_kv_cache,
+                block_table=block_table,
+                slot_mapping=slot_mapping,
+                is_prefill=is_prefill,
+            ),
+        }
+
+    def _build_prefill_kv_plan(
+        self,
+        *,
+        context_lens,
+        q_lens,
+        batch_size,
+        full_kv_cache,
+        win_kv_cache,
+        block_table,
+        slot_mapping,
+        is_prefill,
+    ):
+        if not is_prefill:
+            return None
+
+        device = q_lens.device
+        q_lens = q_lens.to(dtype=torch.int32, device=device)
+        max_q_len = int(q_lens.max().item()) if q_lens.numel() > 0 else 0
+        if max_q_len > 0:
+            token_offsets = torch.arange(max_q_len, dtype=torch.int32, device=device).unsqueeze(0)
+            full_valid_mask = token_offsets < q_lens.unsqueeze(1)
+        else:
+            full_valid_mask = torch.empty((batch_size, 0), dtype=torch.bool, device=device)
+
+        full_kv_gather_indices = slot_mapping.get("full_kv_gather_indices")
+        if full_kv_gather_indices is None:
+            full_kv_gather_indices = self.paged_cache.get_full_kv_gather_indices(context_lens, q_lens)
+            slot_mapping["full_kv_gather_indices"] = full_kv_gather_indices
+
+        win_local_indices = full_kv_gather_indices.to(device=device, dtype=torch.int32) - \
+            context_lens.to(device=device, dtype=torch.int32).unsqueeze(1)
+        win_local_indices = torch.where(
+            (win_local_indices >= 0) & (win_local_indices < q_lens.unsqueeze(1)),
+            win_local_indices,
+            torch.zeros_like(win_local_indices),
+        ).to(dtype=torch.long)
+
+        return {
+            "full_kv_cache": full_kv_cache,
+            "win_kv_cache": win_kv_cache,
+            "full_block_table": block_table.get("full_kv"),
+            "win_block_table": block_table.get("win_kv"),
+            "full_slot_mapping": slot_mapping.get("full_kv"),
+            "win_slot_mapping": slot_mapping.get("win_kv"),
+            "full_kv_gather_indices": full_kv_gather_indices,
+            "full_valid_mask": full_valid_mask,
+            "win_local_indices": win_local_indices,
         }
 
     def _get_slot_mapping_from_block_table(self, seq_lens, position_ids, block_table):
@@ -826,6 +885,25 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
 
         full_kv_cache = pkv.init_full_buffer_c1a()
         win_slot_mapping = pkv.get_win_slot_mapping(context_lens, q_lens, pad_to_window=True)
+        prefill_kv = self._build_prefill_kv_plan(
+            context_lens=context_lens,
+            q_lens=q_lens,
+            batch_size=batch_size,
+            full_kv_cache=full_kv_cache,
+            win_kv_cache=pkv.get_win_kv_for_decode(0)[0],
+            block_table={
+                "full_kv": pkv.get_full_block_table(batch_size),
+                "win_kv": pkv.get_win_kv_for_decode(0)[1],
+            },
+            slot_mapping={
+                "full_kv": pkv.get_full_slot_mapping(context_lens, q_lens),
+                "win_kv": win_slot_mapping,
+                "full_kv_gather_indices": pkv.get_full_kv_gather_indices(context_lens, q_lens),
+            },
+            is_prefill=True,
+        )
+        for metadata in shared_metadata.values():
+            metadata["prefill_kv"] = prefill_kv
         attn_metadata = self._build_golden_style_attn_metadata(
             position_ids=position_ids,
             context_lens=context_lens,
@@ -872,6 +950,7 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
         full_kv_cache, shared_metadata=None,
     ):
         pkv = self.paged_cache
+        prefill_kv = shared_metadata.get("prefill_kv") if shared_metadata else None
         layer_inputs = {
             "q_lens": q_lens,
             "cu_q_lens": cu_q_lens,
@@ -879,9 +958,14 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
             "seq_used_q": seq_used_q,
             "sas_metadata": shared_metadata.get("sas_metadata") if shared_metadata else None,
             "full_kv_cache": full_kv_cache,
-            "full_block_table": pkv.get_full_block_table(batch_size),
-            "full_slot_mapping": pkv.get_full_slot_mapping(context_lens, q_lens),
-            "full_kv_gather_indices": pkv.get_full_kv_gather_indices(context_lens, q_lens),
+            "full_block_table": prefill_kv.get("full_block_table") if prefill_kv else pkv.get_full_block_table(batch_size),
+            "full_slot_mapping": prefill_kv.get("full_slot_mapping") if prefill_kv else pkv.get_full_slot_mapping(context_lens, q_lens),
+            "full_kv_gather_indices": prefill_kv.get("full_kv_gather_indices") if prefill_kv else pkv.get_full_kv_gather_indices(context_lens, q_lens),
+            "win_kv_cache": prefill_kv.get("win_kv_cache") if prefill_kv else None,
+            "win_block_table": prefill_kv.get("win_block_table") if prefill_kv else None,
+            "win_slot_mapping": prefill_kv.get("win_slot_mapping") if prefill_kv else None,
+            "full_valid_mask": prefill_kv.get("full_valid_mask") if prefill_kv else None,
+            "win_local_indices": prefill_kv.get("win_local_indices") if prefill_kv else None,
         }
         if ratio <= 1:
             return layer_inputs

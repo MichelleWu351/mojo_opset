@@ -1096,7 +1096,7 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
         )
         prefill_prof_ctx = prof_mod.profile(
             activities=[prof_mod.ProfilerActivity.CPU, prof_mod.ProfilerActivity.NPU],
-            schedule=prof_mod.schedule(wait=0, warmup=0, active=prof_steps, repeat=1),
+            # schedule=prof_mod.schedule(wait=0, warmup=0, active=prof_steps, repeat=1),
             on_trace_ready=prof_mod.tensorboard_trace_handler(prefill_prof_dir),
             record_shapes=True,
             with_stack=True,
