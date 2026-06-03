@@ -179,11 +179,9 @@ def cube_qkt_sfa(
     wk_base,
     cur_kv,
 ):
-    mask_kv = offs_kv < cur_kv
     offs_d = tl.arange(0, head_dim)
     k = tl.load(
         Wksp_K_ptr + wk_base + offs_kv[:, None] * stride_wk_kv + offs_d[None, :] * stride_wk_d,
-        mask=mask_kv[:, None],
     )
     acc = tl.dot(q, k.trans())
     return acc
@@ -297,6 +295,19 @@ def _gather_kv_to_wksp(
                     Wksp_V_ptr + wk_base_v + ws_offs_token[:, None] * stride_wv_kv
                     + offs_d[None, :] * stride_wv_d, v_vals,
                 )
+        # else:
+        #     # Zero out unused workspace slots to avoid CCU error in tl.dot
+        #     ws_offs_token = j * sparse_block_size + offs_sbs
+        #     zero_k = tl.zeros((sparse_block_size, head_dim), dtype=Wksp_K_ptr.dtype.element_ty)
+        #     zero_v = tl.zeros((sparse_block_size, head_dim), dtype=Wksp_V_ptr.dtype.element_ty)
+        #     tl.store(
+        #         Wksp_K_ptr + wk_base_k + ws_offs_token[:, None] * stride_wk_kv
+        #         + offs_d[None, :] * stride_wk_d, zero_k,
+        #     )
+        #     tl.store(
+        #         Wksp_V_ptr + wk_base_v + ws_offs_token[:, None] * stride_wv_kv
+        #         + offs_d[None, :] * stride_wv_d, zero_v,
+        #     )
 
 
 @triton.jit(do_not_specialize=[
@@ -353,6 +364,9 @@ def _sals_sfa_fwd_kernel(
             q_end = q_start + q_len
             if q_end > T:
                 q_end = T
+            # 用 tl.minimum 替代 if-else，避免在一部分环境上triton 在 then 分支重新推断类型为 int64
+            # （原来的 q_end = T 会让 q_end 在 then 分支变成 int64，与 else 分支 int32 不一致）
+            q_end = tl.minimum(q_end, T.to(q_end.dtype))
             actual_q_len = q_end - q_start
             should_process = should_process & (actual_q_len > 0)
             req_start = tl.load(cumsum_q_len_ptr + qid)
