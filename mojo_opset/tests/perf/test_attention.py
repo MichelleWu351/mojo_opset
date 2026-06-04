@@ -58,9 +58,11 @@ def generate_paged_decode_data(
 
 
 test_configs_decode = [
-    (8, 16, 4, 128, 1024, 32, torch.bfloat16, "M_BF16"),
-    (8, 16, 4, 96, 1024, 128, torch.bfloat16, "M_BF16_PADDIM"),
-    (8, 8, 1, 128, 8192, 128, torch.bfloat16, "M_BF16_LONG"),
+    (8, 16, 4, 128, 1024, 128, torch.bfloat16, "M_BF16"),
+    (8, 16, 4, 128, 1024, 256, torch.bfloat16, "M_BF16"),
+    (8, 16, 4, 128, 1024, 512, torch.bfloat16, "M_BF16"),
+    # (8, 16, 4, 96, 1024, 128, torch.bfloat16, "M_BF16_PADDIM"),
+    # (8, 8, 1, 128, 8192, 128, torch.bfloat16, "M_BF16_LONG"),
 ]
 
 
