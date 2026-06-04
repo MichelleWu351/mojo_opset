@@ -76,7 +76,7 @@ class MojoMoE(MojoOperator):
         # token_indices: [local_tokens]
         expert_outputs = self.experts(sorted_hidden_states, tokens_per_expert)
         # expert_outputs: [local_tokens, H]
-        output_buffer = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
+        output_buffer = torch.zeros_like(hidden_states, memory_format=torch.contiguous_format)
         combined = self.combine(output_buffer, expert_outputs, sorted_gates, token_indices)
         # combined: [num_tokens, H]
         return combined
