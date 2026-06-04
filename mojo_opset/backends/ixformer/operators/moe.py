@@ -516,6 +516,7 @@ class IxformerMoECombine(MojoMoECombine):
 
 class IxformerMoE(MojoMoE):
     supported_platforms_list = ["ilu"]
+    _use_fused_moe = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
@@ -544,6 +545,7 @@ class IxformerMoE(MojoMoE):
 
 class IxformerQuantMoE(MojoQuantMoE):
     supported_platforms_list = ["ilu"]
+    _use_fused_moe = True
 
     def __init__(
         self,
