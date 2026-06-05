@@ -40,7 +40,7 @@ LARGE_PREFILL_SCENARIOS = [
 ]
 
 # Custom test cases as specified:
-# q_len = 4096, kv_len = 16384/32768/65536, q_head_num = 3/4, kv_head_num = 1, sparse_block_size = 64, fixed_tail_blocks = 4
+# q_len = 4096, kv_len = 16384/32768/65536, q_head_num = 3/4, kv_head_num = 1, cache_block_size = 64, fixed_tail_blocks = 4
 CUSTOM_SCENARIOS = [
     (4096, 3, 1, 16384, 64, 4),
     (4096, 3, 1, 32768, 64, 4),
