@@ -128,11 +128,12 @@ import triton.backends.ascend.runtime
 @libentry()
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_SIZE_M": BM, "multibuffer": MF})
+        triton.Config({"BLOCK_SIZE_M": BM, "multibuffer": MF, "enable_vf_fusion": EF, })
         for BM in [1, 2, 4, 8, 16, 32, 64, 128, 256]
-        for MF in [False, True]
+        for MF in [True, False]
+        for EF in [True, False]
     ],
-    key=["n_rows", "n_cols"],
+    key=["n_rows", "n_cols", "X_ptr.dtype"],
 )
 @triton.jit
 def _rmsnorm_infer_kernel_single(
