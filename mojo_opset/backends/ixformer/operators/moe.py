@@ -112,6 +112,81 @@ def _attach_gating_bf16_buffers(gating_module):
     gating_module.register_load_state_dict_post_hook(_transform_gate_weight_post_hook)
 
 
+class IxFormerMoEAllGather:
+
+    ag_stream: torch.cuda.Stream = None
+    hidden_states_event_start: torch.cuda.Event = None
+    hidden_states_event_stop: torch.cuda.Event = None
+    logits_event_start: torch.cuda.Event = None
+    logits_event_stop: torch.cuda.Event = None
+    topk_ids_event_start: torch.cuda.Event = None
+    topk_ids_event_stop: torch.cuda.Event = None
+
+    def __init__(self, group: dist.ProcessGroup):
+        self.group = group
+
+        if self.ag_stream is None:
+            self.ag_stream: torch.cuda.Stream = torch.cuda.Stream()
+
+            self.hidden_states_event_start = torch.cuda.Event()
+            self.hidden_states_event_stop = torch.cuda.Event()
+
+            self.logits_event_start = torch.cuda.Event()
+            self.logits_event_stop = torch.cuda.Event()
+
+            self.topk_ids_event_start = torch.cuda.Event()
+            self.topk_ids_event_stop = torch.cuda.Event()
+
+    def _submit_all_gather(
+        self,
+        out: torch.Tensor,
+        input: torch.Tensor,
+        event_start: torch.cuda.Event,
+        event_stop: torch.cuda.Event
+    ):
+        current_stream = torch.cuda.current_stream()
+        event_start.record(current_stream)
+        self.ag_stream.wait_event(event_start)
+
+        with torch.cuda.stream(self.ag_stream):
+            ixfd.all_gather_into_tensor(output=out, input=input, group=self.group, async_op=True)
+
+        event_stop.record(self.ag_stream)
+
+    def all_gather_hidden_states(self, out: torch.Tensor, input: torch.Tensor):
+        self._submit_all_gather(
+            out=out,
+            input=input,
+            event_start=self.hidden_states_event_start,
+            event_stop=self.hidden_states_event_stop
+        )
+
+    def wait_hidden_states(self):
+        torch.cuda.current_stream().wait_event(self.hidden_states_event_stop)
+
+    def all_gather_topk_gates(self, out: torch.Tensor, input: torch.Tensor):
+        self._submit_all_gather(
+            out=out,
+            input=input,
+            event_start=self.logits_event_start,
+            event_stop=self.logits_event_stop
+        )
+
+    def wait_topk_gates(self):
+        torch.cuda.current_stream().wait_event(self.logits_event_stop)
+
+    def all_gather_topk_ids(self, out: torch.Tensor, input: torch.Tensor):
+        self._submit_all_gather(
+            out=out,
+            input=input,
+            event_start=self.topk_ids_event_start,
+            event_stop=self.topk_ids_event_stop
+        )
+
+    def wait_topk_ids(self):
+        torch.cuda.current_stream().wait_event(self.topk_ids_event_stop)
+
+
 class IxformerMoE(MojoMoE):
     """Fused bf16 MoE: gating, dispatch, group-gemm experts, and combine in a single forward."""
 
@@ -404,6 +479,9 @@ class IxformerQuantMoE(MojoQuantMoE):
             self.gdr_buffer_ptr1 = ixf_f.new_gdr_buffer(self.gdr_device_buffer1)
             self.gdr_buffer_ptr2 = ixf_f.new_gdr_buffer(self.gdr_device_buffer2)
 
+        if self.dp_input and self.ep_size > 1:
+            self.moe_dp_comm = IxFormerMoEAllGather(group=ep_group)
+
     def __del__(self):
         if hasattr(self, "gdr_buffer_ptr"):
             ixf_f.delete_gdr_buffer(self.gdr_buffer_ptr)
@@ -434,9 +512,7 @@ class IxformerQuantMoE(MojoQuantMoE):
                 local_tokens * self.ep_size, hidden_states.shape[1],
                 dtype=hidden_states.dtype, device=hidden_states.device,
             )
-            full_hdl = dist.all_gather_into_tensor(full, hidden_states.contiguous(), group=self.ep_group, async_op=True)
-        else:
-            full_hdl = None
+            self.moe_dp_comm.all_gather_hidden_states(out=full, input=hidden_states.contiguous())
 
         # triple_gemm uses 3 bf16 components of the fp32 gate weight to emulate fp32 matmul precision on bf16 HW.
         gate_logits = ixf_f.triple_gemm_bf16_bf16_fp32(
@@ -449,24 +525,18 @@ class IxformerQuantMoE(MojoQuantMoE):
 
         if self.dp_input and self.ep_size > 1:
             full_indices = torch.empty((local_tokens * self.ep_size, *top_k_indices.shape[1:]), device=top_k_indices.device, dtype=top_k_indices.dtype)
-            indices_hdl = dist.all_gather_into_tensor(full_indices, top_k_indices.contiguous(), group=self.ep_group, async_op=True)
+            self.moe_dp_comm.all_gather_topk_ids(out=full_indices, input=top_k_indices.contiguous())
 
             full_gates = torch.empty((local_tokens * self.ep_size, *top_k_gates.shape[1:]), device=top_k_gates.device, dtype=top_k_gates.dtype)
-            gates_hdl = dist.all_gather_into_tensor(full_gates, top_k_gates.contiguous(), group=self.ep_group, async_op=True)
-        else:
-            indices_hdl = None
-            gates_hdl = None
+            self.moe_dp_comm.all_gather_topk_gates(out=full_gates, input=top_k_gates.contiguous())
 
-        if full_hdl is not None:
-            full_hdl.wait()
+        if self.dp_input and self.ep_size > 1:
+            self.moe_dp_comm.wait_topk_ids()
+
             hidden_states = full
-
-        num_tokens, dim = hidden_states.shape
-
-        if indices_hdl is not None:
-            indices_hdl.wait()
             top_k_indices = full_indices
 
+        num_tokens, dim = hidden_states.shape
         need_gpu_size = self.disable_sync or enable_cuda_graph
 
         if self.ep_size > 1:
@@ -630,8 +700,8 @@ class IxformerQuantMoE(MojoQuantMoE):
             # src_to_dst == -1 marks padding slots that must not be summed.
             reduce_mask = src_to_dst == -1
 
-            if gates_hdl is not None:
-                gates_hdl.wait()
+            if self.dp_input and self.ep_size > 1:
+                self.moe_dp_comm.wait_topk_gates()
                 top_k_gates = full_gates
 
             combined = ixf_f.moe_output_reduce_sum(
