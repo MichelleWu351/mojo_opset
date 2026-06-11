@@ -13,41 +13,39 @@ with shapes
     token_idxs  : (token_num,)                                      int32
     token_num   : int (number of *valid* leading rows of ``key_lr`` to consume)
 
-Performance design (P2-28 rewrite, 2026-06-05)
----------------------------------------------
-The previous wrapper looped on ``num_kv_heads`` and per-head materialised a
-contiguous ``cache_h`` plane, scattered into it, then wrote the plane back to
-``label_cache``. For (256, 8, 512, 128) bf16 that costs ~768 MB of pure
-overhead DRAM traffic on top of ~27 MB of real scatter work — Class § F.3
-(DRAM↔UB 来回). On wide-H shapes this overhead dominates and makes UC much
-slower than TTX.
+Performance design history
+--------------------------
+v1 (pre-P2-28): per-head loop with full ``cache_h`` materialisation +
+write-back — ~768 MB of overhead DRAM traffic per call on H=8 shapes.
 
-This rewrite collapses **all kv-heads into a single kernel launch** by
-treating the cache as one flat ``(num_blocks * num_kv_heads * block_size,
-head_dim)`` slot table:
+v2 (P2-28, 2026-06-05): all-heads-fused single-launch SCATTER with flat
+``(num_blocks * H * BS, D)`` slot view; eliminated per-head launches and
+per-head ``.contiguous()`` cache materialisation. See ``_uc_store_lowrank_bf16``
+docstring below.
 
-* ``label_cache_flat[block * (H*BS) + h * BS + tok, d]``  ≡
-  ``label_cache[block, h, tok, d]``  (true for any contiguous (NB,H,BS,D)
-  storage, which mojo / torch always produce here).
-* Source: ``key_lr[:M].view(M*H, D)`` — already DRAM-contiguous, no
-  ``.contiguous()`` copy needed when the caller passes a normal tensor.
-* Build a single ``(M*H,) int32`` ``slot_idx`` vector on device:
+v3 (P1-G6, 2026-06-11): wrapper host plan micro-optimisation while keeping
+the v2 kernel ABI intact. Three independent host-side wins:
 
-      slot[m*H + h] = block_idxs[m] * (H*BS) + h * BS + token_idxs[m]
+  * **Cache ``h_off = arange(H, int32, device) * BS``** at module level —
+    these two NPU ops never depend on per-call data, so they should run
+    once per (H, BS, device) tuple, not every call. Saves ~70 µs/call on
+    NPU (full plan rebuild: 104 µs → 32 µs on the H=8 hot path).
+  * **H=1 broadcast collapse** — when ``num_kv_heads == 1`` the broadcast
+    + reshape chain reduces to identity (``slot_idx = base``), saving the
+    final ~31 µs of NPU ops for all H=1 shapes (~7/14 perf test rows).
+  * **Drop redundant ``.contiguous()``** after ``.reshape(-1)`` — verified
+    is_contiguous()=True after broadcast+reshape, the trailing ``.contiguous()``
+    is a wasted NPU op.
+  * **Drop redundant ``.to(torch.int32)``** — public ``forward`` already
+    asserts both ``block_idxs`` / ``token_idxs`` are int32, the inner
+    helper does not need defensive casts on the hot path.
 
-  This is one fused arithmetic broadcast on the host side — negligible
-  vs the per-head copy overhead we eliminate.
+Kernel ABI is unchanged from v2 (still ``mojo_store_lowrank_bf16(key_lr,
+slot_idx, label_cache, M, D, S)``), reuses the wheel _kernels.so without
+rebuild.
 
-The wheel kernel signature stays:
-
-    mojo_store_lowrank_bf16(key_lr_flat, slot_idx, label_cache_flat, M, D, S)
-
-We just call it once with ``M' = M * num_kv_heads`` and ``S' = num_blocks *
-num_kv_heads * block_size``. The label_cache memory is mutated in place via
-the ``.view`` (no copy back).
-
-Fallback (super().forward) routes back to torch advanced indexing whenever
-the fast path's preconditions fail: dtype != bf16, kernel API missing,
+Fallback (raise NotImplementedError) routes to other backends whenever the
+fast path's preconditions fail: dtype != bf16, kernel API missing,
 key_lr/label_cache rank wrong, token_num <= 0, or label_cache non-contiguous
 (rare — a fresh ``torch.zeros(...)`` BNSD is always contiguous).
 """
@@ -68,6 +66,40 @@ _API = "mojo_store_lowrank_bf16"
 # tail rows are scattered on the host (cheap — at most ROW_TILE-1 rows, and
 # torch advanced indexing on a contiguous flat view is fast on NPU).
 _KERNEL_ROW_TILE = 128
+
+# Cache for the (H,) int32 head-offset vector ``arange(H) * BS``.
+#
+# This vector only depends on (num_kv_heads, block_size, device). All three
+# are effectively static across inference (per-model config + single device
+# per wrapper instance), so building it on every call wastes 25-30 µs of
+# NPU launch overhead (one ``torch.arange`` + one element-wise mul on top of
+# the scalar scaffold). Micro-bench on 910B NPU=4, kv=13312 H=8:
+#   full host plan rebuild: 104 µs  (uncached, every call)
+#   full host plan rebuild:  32 µs  (h_off cached)
+# Savings scale with call count — for hot inference loops this is pure win.
+# Pattern follows lessons §I.5 (host launch floor) / §D.2 (per-instance
+# cache by hashable spec) introduced by UCRelativeEmbedding.
+#
+# Cache invariants:
+#   * (H, BS): purely structural integers, never mutate after init
+#   * device: pinned per cache entry; multi-device callers get one entry
+#     per device (extra 25 µs once per device)
+# We never invalidate; entries live for the process lifetime. Total size is
+# O(distinct_H × distinct_BS × distinct_device), bounded by a handful in
+# practice (kv_heads ∈ {1, 8, ...}, block_size ∈ {512, ...}).
+_H_OFF_CACHE: dict = {}
+
+
+def _get_h_off(H: int, BS: int, device: torch.device) -> torch.Tensor:
+    """Cached ``arange(H, int32, device) * BS`` to skip 2 NPU op launches
+    per call. See module-level ``_H_OFF_CACHE`` docstring and lessons §I.5.
+    """
+    key = (H, BS, device)
+    cached = _H_OFF_CACHE.get(key)
+    if cached is None:
+        cached = torch.arange(H, dtype=torch.int32, device=device) * BS
+        _H_OFF_CACHE[key] = cached
+    return cached
 
 
 def _uc_store_lowrank_bf16(
@@ -93,13 +125,29 @@ def _uc_store_lowrank_bf16(
     # Build the fused (M*H,) int32 slot vector with one broadcast on device.
     # slot_idx[m*H + h] = block_idxs[m] * (H*BS) + h * BS + token_idxs[m]
     # Layout matches `key_lr[:M].view(M*H, D)` row-major.
+    #
+    # Skip ``.to(torch.int32)`` casts on inputs: ``UCStoreLowrank.forward``
+    # below already asserts both ``block_idxs`` / ``token_idxs`` are int32,
+    # so the conversion is purely defensive and short-circuits to a no-op
+    # in PyTorch — but each call still pays Python-side attribute lookups.
+    # Drop them on the fast path; the public ``forward`` is the contract
+    # boundary.
     H = num_kv_heads
     BS = block_size
-    block_i32 = block_idxs[:token_num].to(torch.int32)
-    token_i32 = token_idxs[:token_num].to(torch.int32)
-    base = block_i32 * (H * BS) + token_i32                    # (M,)
-    h_off = torch.arange(H, dtype=torch.int32, device=device) * BS  # (H,)
-    slot_idx = (base.unsqueeze(1) + h_off.unsqueeze(0)).reshape(-1).contiguous()  # (M*H,)
+    base = block_idxs[:token_num] * (H * BS) + token_idxs[:token_num]   # (M,)
+    if H == 1:
+        # H=1 — the per-head broadcast collapses to identity (only h=0).
+        # Skip the ``unsqueeze + broadcast + reshape`` chain entirely:
+        # micro-bench on 910B saves ~31 µs/call (3 NPU ops fused away).
+        slot_idx = base
+    else:
+        # H>1 — fuse per-head broadcast with cached ``h_off``.
+        h_off = _get_h_off(H, BS, device)                                  # (H,)
+        # ``.reshape(-1)`` after a broadcasted add always materialises a
+        # contiguous buffer (verified is_contiguous()=True, stride=(1,));
+        # the historical ``.contiguous()`` tail is a redundant NPU op —
+        # drop it.
+        slot_idx = (base.unsqueeze(1) + h_off.unsqueeze(0)).reshape(-1)    # (M*H,)
 
     # Source: (token_num, H, D) -> (M*H, D). When caller passes a contiguous
     # tensor (the common case), .contiguous() is a free no-op.
