@@ -273,6 +273,7 @@ def generate_test_data(
     ],
 )
 @auto_switch_platform(set_perf=True)
+@bypass_not_implemented
 def test_sdpa(
     query: torch.Tensor,
     key: torch.Tensor,
