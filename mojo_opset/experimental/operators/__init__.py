@@ -13,6 +13,7 @@ from .attention import MojoPrefillMLA
 from .attention import MojoPrefillNSA
 from .attention_gate import MojoFusedAttnGateConcat
 from .attention_gate import MojoFusedAttnOutputGate
+from .compute_with_comm import MojoFusedAGScaleQuant
 from .gemm import MojoQuantBatchGemmReduceSum
 from .indexer import MojoIndexer
 from .indexer import MojoLightningIndexer
@@ -24,6 +25,7 @@ from .moe import MojoFusedSwiGLUMoEScaleDynamicQuantize
 from .moe import MojoMoEInitRoutingDynamicQuant
 from .normalization import MojoChannelRMSNorm
 from .normalization import MojoGroupLayerNorm
+from .normalization import MojoQKInplaceRMSNorm
 from .position_embedding import MojoGridRoPE
 from .position_embedding import MojoRelativeEmbedding
 from .position_embedding import MojoRotaryEmbedding
@@ -33,6 +35,7 @@ __all__ = [
     "MojoRotateActivation",
     "MojoFusedAttnGateConcat",
     "MojoFusedAttnOutputGate",
+    "MojoFusedAGScaleQuant",
     "MojoIndexer",
     "MojoLightningIndexer",
     "MojoPrefillMLA",
@@ -55,6 +58,7 @@ __all__ = [
     "MojoFusedSwiGLUMoEScaleDynamicQuantize",
     "MojoGroupLayerNorm",
     "MojoChannelRMSNorm",
+    "MojoQKInplaceRMSNorm",
     "MojoRelativeEmbedding",
     "MojoGridRoPE",
     "MojoRotaryEmbedding",

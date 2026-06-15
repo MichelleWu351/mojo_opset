@@ -21,6 +21,7 @@ from .operators.attention import MojoPrefillNSA
 from .operators.attention_gate import MojoFusedAttnGateConcat
 from .operators.attention_gate import MojoFusedAttnOutputGate
 from .operators.attention import MojoPagedPrefillSageGQA
+from .operators.compute_with_comm import MojoFusedAGScaleQuant
 from .operators.deepep import MojoDeepEPCombine
 from .operators.deepep import MojoDeepEPDispatch
 from .operators.gemm import MojoQuantBatchGemmReduceSum
@@ -34,6 +35,7 @@ from .operators.moe import MojoFusedSwiGLUMoEScaleDynamicQuantize
 from .operators.moe import MojoMoEInitRoutingDynamicQuant
 from .operators.normalization import MojoChannelRMSNorm
 from .operators.normalization import MojoGroupLayerNorm
+from .operators.normalization import MojoQKInplaceRMSNorm
 from .operators.position_embedding import MojoGridRoPE
 from .operators.position_embedding import MojoRelativeEmbedding
 from .operators.position_embedding import MojoRotaryEmbedding
@@ -59,6 +61,7 @@ __all__ = [
     "MojoPagedDecodeSWAWithKVDequant",
     "MojoFusedAttnGateConcat",
     "MojoFusedAttnOutputGate",
+    "MojoFusedAGScaleQuant",
     "MojoPagedPrefillSageGQA",
     "MojoGatherRopeStore",
     "MojoPagedAttentionStoreKvCache",
@@ -68,6 +71,7 @@ __all__ = [
     "MojoFusedSwiGLUMoEScaleDynamicQuantize",
     "MojoGroupLayerNorm",
     "MojoChannelRMSNorm",
+    "MojoQKInplaceRMSNorm",
     "MojoRelativeEmbedding",
     "MojoGridRoPE",
     "MojoRotaryEmbedding",
