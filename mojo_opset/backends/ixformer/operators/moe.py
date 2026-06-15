@@ -1,13 +1,15 @@
 import os
 import torch
 import torch.distributed as dist
-from typing import Union
+from typing import Union, Optional
 
 from mojo_opset.core import MojoMoE
 from mojo_opset.core import MojoQuantMoE
 
 from ixformer import functions as ixf_f
 import ixformer.distributed as ixfd
+import torch.distributed.distributed_c10d as c10d
+
 
 def decompose_fp32_to_3bf16(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
@@ -112,9 +114,25 @@ def _attach_gating_bf16_buffers(gating_module):
     gating_module.register_load_state_dict_post_hook(_transform_gate_weight_post_hook)
 
 
-class IxFormerMoEAllGather:
+def clone_process_group(group: Optional[dist.ProcessGroup] = None):
+    group = group or c10d._get_default_group()
+    return dist.new_group(
+        ranks=dist.get_process_group_ranks(group), backend=dist.get_backend(group)
+    )
 
+
+class IxFormerMoEAllGather:
+    """
+    compute stream:  |---- triple gemm ----|-- topk softmax-- |---- moe permute ops + group gemm ----|
+    ag_stream:       |----------- all gather hidden states -----------|- all gather topk gates -|
+    extra_ag_stream: |-- all gather topk_ids --|
+    """
+
+    # ag_stream overlap with compute stream
     ag_stream: torch.cuda.Stream = None
+
+    # extra_ag_stream overlap with ag_stream
+    extra_ag_stream: torch.cuda.Stream = None
     hidden_states_event_start: torch.cuda.Event = None
     hidden_states_event_stop: torch.cuda.Event = None
     logits_event_start: torch.cuda.Event = None
@@ -122,11 +140,20 @@ class IxFormerMoEAllGather:
     topk_ids_event_start: torch.cuda.Event = None
     topk_ids_event_stop: torch.cuda.Event = None
 
-    def __init__(self, group: dist.ProcessGroup):
+    extra_group: dist.ProcessGroup = None
+
+    def __init__(self, group: dist.ProcessGroup, parallel_all_gather: bool = True):
         self.group = group
+        self.parallel_all_gather = parallel_all_gather
 
         if self.ag_stream is None:
+            self.extra_group = clone_process_group(group) if parallel_all_gather else group
+
             self.ag_stream: torch.cuda.Stream = torch.cuda.Stream()
+            if parallel_all_gather:
+                self.extra_ag_stream = torch.cuda.Stream()
+            else:
+                self.extra_ag_stream = self.ag_stream
 
             self.hidden_states_event_start = torch.cuda.Event()
             self.hidden_states_event_stop = torch.cuda.Event()
@@ -141,22 +168,26 @@ class IxFormerMoEAllGather:
         self,
         out: torch.Tensor,
         input: torch.Tensor,
+        ag_stream: torch.cuda.Stream,
         event_start: torch.cuda.Event,
         event_stop: torch.cuda.Event
     ):
         current_stream = torch.cuda.current_stream()
         event_start.record(current_stream)
-        self.ag_stream.wait_event(event_start)
+        ag_stream.wait_event(event_start)
 
-        with torch.cuda.stream(self.ag_stream):
-            ixfd.all_gather_into_tensor(output=out, input=input, group=self.group, async_op=True)
+        group = self.group if ag_stream == self.ag_stream else self.extra_group
 
-        event_stop.record(self.ag_stream)
+        with torch.cuda.stream(ag_stream):
+            ixfd.all_gather_into_tensor(output=out, input=input, group=group, async_op=True)
+
+        event_stop.record(ag_stream)
 
     def all_gather_hidden_states(self, out: torch.Tensor, input: torch.Tensor):
         self._submit_all_gather(
             out=out,
             input=input,
+            ag_stream=self.ag_stream,
             event_start=self.hidden_states_event_start,
             event_stop=self.hidden_states_event_stop
         )
@@ -168,6 +199,7 @@ class IxFormerMoEAllGather:
         self._submit_all_gather(
             out=out,
             input=input,
+            ag_stream=self.ag_stream,
             event_start=self.logits_event_start,
             event_stop=self.logits_event_stop
         )
@@ -179,6 +211,7 @@ class IxFormerMoEAllGather:
         self._submit_all_gather(
             out=out,
             input=input,
+            ag_stream=self.extra_ag_stream,
             event_start=self.topk_ids_event_start,
             event_stop=self.topk_ids_event_stop
         )
@@ -566,11 +599,11 @@ class IxformerQuantMoE(MojoQuantMoE):
                 gdr_buffer_ptr=None if need_gpu_size else self.gdr_buffer_ptr,
             )
             expand_tokens = num_tokens * self.top_k
-        
+
+        if self.dp_input and self.ep_size > 1:
+            self.moe_dp_comm.wait_hidden_states()
+
         if sorted_token_ids.shape[0] == 0:
-            if gates_hdl is not None:
-                # avoid handle leakage
-                gates_hdl.wait()
             combined = torch.zeros(
                 num_tokens, self.hidden_size,
                 dtype=hidden_states.dtype, device=hidden_states.device,
