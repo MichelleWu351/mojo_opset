@@ -893,7 +893,7 @@ def _swa_paged_decode_kernel(
             # avoid division by zero
             acc = acc / l_i[:, None]
         acc = tl.reshape(acc, [Q_SEQLEN, BLOCK_SIZE_Q_HEADS, BLOCK_SIZE_D])
-        o_ptrs = o_ptr + b_id * stride_ob + offs_s[:, None, None] * stride_qs + offs_head_block[None, :, None] * stride_qh + offs_d[None, None, :] * stride_qd
+        o_ptrs = o_ptr + b_id * stride_ob + offs_s[:, None, None] * stride_os + offs_head_block[None, :, None] * stride_oh + offs_d[None, None, :] * stride_od
         tl.store(o_ptrs, acc.to(o_ptr.dtype.element_ty), mask = (offs_d[None, None, :] < HEAD_DIM) & (offs_gqa_block[None, :, None] < GQA_GROUP_SIZE))
 
 
