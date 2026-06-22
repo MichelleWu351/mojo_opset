@@ -35,6 +35,9 @@ ARCH_MAP = {
 _MEM_PROFILING = os.getenv("MEM_PROFILING", "0") == "1"
 _PERF_PRINTING = os.getenv("MOJO_PRINT_PERF", "0") == "1"
 _PERF_SYNC = os.getenv("MOJO_PERF_SYNC", "1") == "1"
+_SKIP_GUARD_EVAL_AFTER_WARMUP = os.getenv(
+    "MOJO_SKIP_GUARD_EVAL_AFTER_WARMUP", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _perf_barrier():
@@ -1466,13 +1469,13 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
                         advance_cache=False,
                         return_last_logits=False,
                         skip_guard_eval=(
-                            enable_main_cache_compile and
+                            (enable_main_cache_compile or _SKIP_GUARD_EVAL_AFTER_WARMUP) and
                             decode_fn is not None and
                             main_decode_graph_warmed
                         ),
                         return_model_time=True,
                     )
-                    if enable_main_cache_compile and decode_fn is not None:
+                    if (enable_main_cache_compile or _SKIP_GUARD_EVAL_AFTER_WARMUP) and decode_fn is not None:
                         main_decode_graph_warmed = True
                 else:
                     next_token_logits, past_key_values, _, decode_model_time = forward_main_decode_mojo(
@@ -1482,8 +1485,15 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
                         runtime_state=runtime_state,
                         decode_fn=decode_fn,
                         use_attn_metadata=use_attn_metadata,
+                        skip_guard_eval=(
+                            _SKIP_GUARD_EVAL_AFTER_WARMUP and
+                            decode_fn is not None and
+                            main_decode_graph_warmed
+                        ),
                         return_model_time=True,
                     )
+                    if _SKIP_GUARD_EVAL_AFTER_WARMUP and decode_fn is not None:
+                        main_decode_graph_warmed = True
 
             if step == 0 and decode_fn is not None and should_print:
                 print("[GRAPH] First decode step done (compilation triggered on this step)")

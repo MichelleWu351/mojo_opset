@@ -3,7 +3,7 @@ import json
 import os
 import logging
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Tuple
 
 import torch
@@ -75,6 +75,7 @@ _DSV4_LAYER_PROFILE_STATS = {}
 _MOE_SHARED_EXPERT_STREAMS = {}
 _ATTN_MLA_STREAMS = {}
 _ATTN_COMPRESSOR_STREAMS = {}
+_ATTN_INDEXER_STREAMS = {}
 _NPU_FRACTAL_NZ_FORMAT = 29
 
 def _create_contiguous_subgroup(
@@ -184,6 +185,25 @@ def get_dsv4_layer_profile():
         }
         for layer_idx, stats in sorted(_DSV4_LAYER_PROFILE_STATS.items())
     }
+
+
+def _get_global_attn_indexer_stream():
+    device_idx = torch.npu.current_device()
+    stream = _ATTN_INDEXER_STREAMS.get(device_idx)
+    if stream is None:
+        stream = torch.npu.Stream()
+        _ATTN_INDEXER_STREAMS[device_idx] = stream
+    return stream
+
+
+@contextmanager
+def _npugraph_limit_core_num(enable: bool, aic_num: int, aiv_num: int):
+    if enable and hasattr(torch.npu, "npugraph_ex"):
+        with torch.npu.npugraph_ex.scope.limit_core_num(aic_num, aiv_num):
+            yield
+    else:
+        yield
+
 
 def _get_had_pow2(n: int, norm: bool = True, device: Optional[torch.device] = None) -> torch.Tensor:
     if not ((n & (n - 1) == 0) and (n > 0)):
@@ -1171,11 +1191,28 @@ class DeepseekV4Indexer(nn.Module):
         if self.wq_b.weight_scale.dtype != torch.float32:
             self.wq_b.weight_scale.data = self.wq_b.weight_scale.data.float()
 
+    def project_query(self, qr, cos, sin, batch_size: int, seq_len: int, layer_idx=0):
+        qr_flat = qr.reshape(-1, self.q_lora_rank).to(torch.bfloat16)
+        qr_quant, qr_scale = _dynamic_quant_per_token(qr_flat)
+        return self.project_query_quantized(qr_quant, qr_scale, cos, sin, batch_size, seq_len, layer_idx)
+
+    def project_query_quantized(self, qr_quant, qr_scale, cos, sin, batch_size: int, seq_len: int, layer_idx=0):
+        with _profile_timer(layer_idx, "indexer_q_proj_rope"):
+            q = self.wq_b(qr_quant, qr_scale)
+            q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)
+            q = _apply_partial_rotary(q, cos, sin, self.partial_slice)
+            q = _rotate_activation(q, self.hadamard_matrix)
+        return q
+
     def forward(self, x, qr, cos, sin, past_key_values=None, layer_idx=0,
                 cu_seqlens_q=None, seq_lens=None, start_pos: Optional[torch.Tensor] = None,
                 state_block_table: Optional[torch.Tensor] = None,
                 seq_used_q: Optional[torch.Tensor] = None,
-                attn_inputs: Optional[dict] = None):
+                attn_inputs: Optional[dict] = None,
+                precomputed_query: Optional[torch.Tensor] = None,
+                precomputed_query_event=None,
+                precomputed_query_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                precomputed_query_quant_event=None):
         batch_size, seq_len, _ = x.shape
 
         with _profile_timer(layer_idx, "indexer_weights_proj"):
@@ -1216,22 +1253,31 @@ class DeepseekV4Indexer(nn.Module):
             li_cmp_slot_mapping.reshape(-1, 1),
             kv_quant.view(-1, self.head_dim),
         )
-        with _profile_timer(layer_idx, "indexer_q_proj_rope"):
-            qr_flat = qr.reshape(-1, self.q_lora_rank).to(torch.bfloat16)
-            qr_quant, qr_scale = _dynamic_quant_per_token(qr_flat)
-            q = self.wq_b(qr_quant, qr_scale)
-            q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)
-            q = _apply_partial_rotary(q, cos, sin, self.partial_slice)
-            q = _rotate_activation(q, self.hadamard_matrix)
 
         li_cmp_kv = attn_inputs["li_cmp_kv"]
         li_key_dequant_scale = attn_inputs["li_key_dequant_scale"]
         c4a_block_table = attn_inputs["c4a_cmp_kv_block_table"]
 
-        q_flat = q.flatten(0, 1)
-        with _profile_timer(layer_idx, "indexer_q_quant"):
-            q_quant, q_scale = _dynamic_quant_per_token(q_flat)
-            q_scale = q_scale.to(torch.float16)
+        if precomputed_query_quant is None:
+            if precomputed_query is None:
+                q = self.project_query(qr, cos, sin, batch_size, seq_len, layer_idx)
+            else:
+                if precomputed_query_event is not None:
+                    current_stream = torch.npu.current_stream()
+                    current_stream.wait_event(precomputed_query_event)
+                q = precomputed_query
+                q.record_stream(torch.npu.current_stream())
+
+            q_flat = q.flatten(0, 1)
+            with _profile_timer(layer_idx, "indexer_q_quant"):
+                q_quant, q_scale = _dynamic_quant_per_token(q_flat)
+                q_scale = q_scale.to(torch.float16)
+        else:
+            if precomputed_query_quant_event is not None:
+                torch.npu.current_stream().wait_event(precomputed_query_quant_event)
+            q_quant, q_scale = precomputed_query_quant
+            q_quant.record_stream(torch.npu.current_stream())
+            q_scale.record_stream(torch.npu.current_stream())
 
         actual_seq_q = cu_seqlens_q[1:]
         actual_seq_k = seq_lens if seq_lens is not None else torch.tensor([seq_len], dtype=torch.int32, device=x.device)
@@ -1272,7 +1318,7 @@ class DeepseekV4Indexer(nn.Module):
                 key_quant_mode=0, query_quant_mode=0,
                 metadata=li_metadata,
             )
-        topk_view = topk_idxs.view(q_flat.shape[0], -1, self.index_topk)
+        topk_view = topk_idxs.view(q_quant.shape[0], -1, self.index_topk)
         return topk_view
 
 
@@ -1346,6 +1392,25 @@ class DeepseekV4Attention(nn.Module):
         self.scatter_nd_update = MojoScatterNdUpdateAsc()
         self.enable_attn_mla_multi_stream = os.getenv("MOJO_ATTN_MLA_MULTI_STREAM", "0") == "1"
         self.enable_attn_compressor_multi_stream = os.getenv("MOJO_ATTN_COMPRESSOR_MULTI_STREAM", "0") == "1"
+        self.enable_attn_indexer_multi_stream = (
+            os.getenv("MOJO_ATTN_INDEXER_MULTI_STREAM", os.getenv("MOJO_ATTN_MLA_MULTI_STREAM", "0")) == "1"
+        )
+        self.enable_attn_limit_core = os.getenv("MOJO_ATTN_LIMIT_CORE", "0") == "1"
+        self.attn_total_aic_num = int(os.getenv("MOJO_ATTN_TOTAL_AIC_NUM", "24"))
+        self.attn_aiv_to_aic_ratio = int(os.getenv("MOJO_ATTN_AIV_TO_AIC_RATIO", "2"))
+        self.attn_compressor_aic_num = int(os.getenv("MOJO_ATTN_COMPRESSOR_AIC_NUM", "16"))
+        self.attn_indexer_aic_num = int(
+            os.getenv(
+                "MOJO_ATTN_INDEXER_AIC_NUM",
+                str(max(self.attn_total_aic_num - self.attn_compressor_aic_num, 1)),
+            )
+        )
+        self.attn_qb_aic_num = int(
+            os.getenv(
+                "MOJO_ATTN_QB_AIC_NUM",
+                str(max(self.attn_total_aic_num - self.attn_compressor_aic_num, 1)),
+            )
+        )
         if self.enable_attn_mla_multi_stream:
             self.mla_stream = _get_global_attn_mla_stream()
             self.mla_input_ready_event = torch.npu.Event()
@@ -1364,6 +1429,16 @@ class DeepseekV4Attention(nn.Module):
             self.compressor_stream = None
             self.compressor_input_ready_event = None
             self.compressor_done_event = None
+        if self.enable_attn_indexer_multi_stream:
+            self.indexer_stream = _get_global_attn_indexer_stream()
+            self.indexer_input_ready_event = torch.npu.Event()
+            self.indexer_query_done_event = torch.npu.Event()
+            self.indexer_query_quant_done_event = torch.npu.Event()
+        else:
+            self.indexer_stream = None
+            self.indexer_input_ready_event = None
+            self.indexer_query_done_event = None
+            self.indexer_query_quant_done_event = None
 
     def prepare_wo_a_weight(self) -> torch.Tensor:
         weight = self.wo_a.weight
@@ -1442,6 +1517,12 @@ class DeepseekV4Attention(nn.Module):
     def _use_compressor_multi_stream(self, is_prefill: bool) -> bool:
         return self.enable_attn_compressor_multi_stream and not is_prefill and self.sfa_compressor is not None
 
+    def _use_indexer_multi_stream(self, is_prefill: bool) -> bool:
+        return self.enable_attn_indexer_multi_stream and not is_prefill and self.indexer is not None
+
+    def _use_attn_limit_core(self, is_prefill: bool) -> bool:
+        return self.enable_attn_limit_core and not is_prefill and self.enable_attn_indexer_multi_stream
+
     def _ensure_mla_multi_stream(self):
         if self.mla_stream is None:
             self.mla_stream = _get_global_attn_mla_stream()
@@ -1461,6 +1542,22 @@ class DeepseekV4Attention(nn.Module):
         if self.compressor_done_event is None:
             self.compressor_done_event = torch.npu.Event()
         return self.compressor_stream, self.compressor_input_ready_event, self.compressor_done_event
+
+    def _ensure_indexer_multi_stream(self):
+        if self.indexer_stream is None:
+            self.indexer_stream = _get_global_attn_indexer_stream()
+        if self.indexer_input_ready_event is None:
+            self.indexer_input_ready_event = torch.npu.Event()
+        if self.indexer_query_done_event is None:
+            self.indexer_query_done_event = torch.npu.Event()
+        if self.indexer_query_quant_done_event is None:
+            self.indexer_query_quant_done_event = torch.npu.Event()
+        return (
+            self.indexer_stream,
+            self.indexer_input_ready_event,
+            self.indexer_query_done_event,
+            self.indexer_query_quant_done_event,
+        )
 
     def _launch_kv_mla_prolog(
         self,
@@ -1488,6 +1585,64 @@ class DeepseekV4Attention(nn.Module):
             kv.record_stream(mla_stream)
             kv_done_event.record(mla_stream)
         return kv, wkv_done_event, kv_done_event
+
+    def _launch_indexer_query_proj(
+        self,
+        qa_quant: torch.Tensor,
+        qa_scale: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        batch_size: int,
+        seq_length: int,
+        is_prefill: bool,
+    ):
+        indexer_stream, ready_event, done_event, _ = self._ensure_indexer_multi_stream()
+        main_stream = torch.npu.current_stream()
+        ready_event.record(main_stream)
+        with torch.npu.stream(indexer_stream):
+            indexer_stream.wait_event(ready_event)
+            qa_quant.record_stream(indexer_stream)
+            qa_scale.record_stream(indexer_stream)
+            cos.record_stream(indexer_stream)
+            sin.record_stream(indexer_stream)
+            with _npugraph_limit_core_num(
+                self._use_attn_limit_core(is_prefill),
+                self.attn_indexer_aic_num,
+                self.attn_indexer_aic_num * self.attn_aiv_to_aic_ratio,
+            ):
+                q = self.indexer.project_query_quantized(
+                    qa_quant, qa_scale, cos, sin, batch_size, seq_length, self.layer_idx
+                )
+            q.record_stream(indexer_stream)
+            done_event.record(indexer_stream)
+        return q, done_event
+
+    def _launch_indexer_query_quant(
+        self,
+        q: torch.Tensor,
+        q_ready_event,
+        compressor_done_event,
+        is_prefill: bool,
+    ):
+        indexer_stream, _, _, done_event = self._ensure_indexer_multi_stream()
+        with torch.npu.stream(indexer_stream):
+            if q_ready_event is not None:
+                indexer_stream.wait_event(q_ready_event)
+            if compressor_done_event is not None:
+                indexer_stream.wait_event(compressor_done_event)
+            q.record_stream(indexer_stream)
+            with _npugraph_limit_core_num(
+                self._use_attn_limit_core(is_prefill),
+                self.attn_indexer_aic_num,
+                self.attn_indexer_aic_num * self.attn_aiv_to_aic_ratio,
+            ):
+                q_flat = q.flatten(0, 1)
+                q_quant, q_scale = _dynamic_quant_per_token(q_flat)
+                q_scale = q_scale.to(torch.float16)
+            q_quant.record_stream(indexer_stream)
+            q_scale.record_stream(indexer_stream)
+            done_event.record(indexer_stream)
+        return (q_quant, q_scale), done_event
 
     def _run_sfa_compressor(
         self,
@@ -1548,19 +1703,24 @@ class DeepseekV4Attention(nn.Module):
             ):
                 if tensor is not None:
                     tensor.record_stream(compressor_stream)
-            with _profile_timer(self.layer_idx, "compressor"):
-                self._run_sfa_compressor(
-                    hidden_states,
-                    cmp_cos,
-                    cmp_sin,
-                    sfa_state_cache,
-                    state_block_table,
-                    cu_seqlens_q,
-                    seq_used_q,
-                    start_pos,
-                    cmp_cache,
-                    cmp_slot_mapping,
-                )
+            with _npugraph_limit_core_num(
+                self._use_attn_limit_core(False),
+                self.attn_compressor_aic_num,
+                self.attn_compressor_aic_num * self.attn_aiv_to_aic_ratio,
+            ):
+                with _profile_timer(self.layer_idx, "compressor"):
+                    self._run_sfa_compressor(
+                        hidden_states,
+                        cmp_cos,
+                        cmp_sin,
+                        sfa_state_cache,
+                        state_block_table,
+                        cu_seqlens_q,
+                        seq_used_q,
+                        start_pos,
+                        cmp_cache,
+                        cmp_slot_mapping,
+                    )
             done_event.record(compressor_stream)
         return done_event
 
@@ -1761,10 +1921,35 @@ class DeepseekV4Attention(nn.Module):
                 else torch.zeros(batch_size, dtype=torch.long, device=hidden_states.device)
             )
 
+        cmp_sparse_indices = None
+        compressor_done_event = None
+        sfa_compressor_args = None
+        if self.sfa_compressor is not None and not self._is_cp_prefill(attn_inputs, is_prefill):
+            start_pos = attn_inputs["start_pos"]
+            seq_used_q = attn_inputs["seq_used_q"]
+            cmp_rope_position_ids = attn_inputs["cmp_rope_position_ids"]
+            state_block_table = attn_inputs["state_block_table"]
+            cmp_slot_mapping = attn_inputs["cmp_slot_mapping"]
+            sfa_state_cache = attn_inputs["sfa_state_cache"]
+            cmp_cache = attn_inputs["cmp_kv_cache"]
+            cmp_cos, cmp_sin = self.compress_rotary_emb(hidden_states, cmp_rope_position_ids)
+            sfa_compressor_args = (
+                hidden_states,
+                cmp_cos,
+                cmp_sin,
+                sfa_state_cache,
+                state_block_table,
+                cu_seqlens_q,
+                seq_used_q,
+                start_pos,
+                cmp_cache,
+                cmp_slot_mapping,
+            )
+
         with _profile_timer(self.layer_idx, "attention_setup"):
             h_flat = hidden_states.reshape(-1, hidden_states.shape[-1]).to(torch.bfloat16)
             cos, sin = position_embeddings
-
+    
             qa = self.wq_a(h_flat)
             use_mla_multi_stream = self._use_mla_multi_stream(is_prefill)
             if use_mla_multi_stream:
@@ -1774,7 +1959,7 @@ class DeepseekV4Attention(nn.Module):
             else:
                 wkv_done_event = None
                 kv_done_event = None
-
+    
             qa = qa.view(batch_size, seq_length, -1)
             qa = self.q_norm(qa)
             qa_flat = qa.reshape(-1, qa.shape[-1]).to(torch.bfloat16)
@@ -1785,15 +1970,28 @@ class DeepseekV4Attention(nn.Module):
                 qa_quant,
                 qa_scale,
             )
+            if self._use_compressor_multi_stream(is_prefill) and sfa_compressor_args is not None:
+                compressor_done_event = self._launch_sfa_compressor(*sfa_compressor_args)
             q = q.view(batch_size, seq_length, self.num_heads, self.head_dim)
-            q = self.q_b_norm(q)
-
-            if not use_mla_multi_stream:
-                kv = self.wkv(h_flat)
-                kv = self.kv_norm(kv)
-                kv = kv.view(batch_size, seq_length, self.head_dim)
-
-            q = _apply_partial_rotary(q, cos, sin, self.partial_slice)
+            precomputed_indexer_query = None
+            precomputed_indexer_query_event = None
+            if self._use_indexer_multi_stream(is_prefill):
+                precomputed_indexer_query, precomputed_indexer_query_event = self._launch_indexer_query_proj(
+                    qa_quant, qa_scale, cos, sin, batch_size, seq_length, is_prefill
+                )
+            with _npugraph_limit_core_num(
+                self._use_attn_limit_core(is_prefill),
+                self.attn_qb_aic_num,
+                self.attn_qb_aic_num * self.attn_aiv_to_aic_ratio,
+            ):
+                q = self.q_b_norm(q)
+    
+                if not use_mla_multi_stream:
+                    kv = self.wkv(h_flat)
+                    kv = self.kv_norm(kv)
+                    kv = kv.view(batch_size, seq_length, self.head_dim)
+    
+                q = _apply_partial_rotary(q, cos, sin, self.partial_slice)
             if use_mla_multi_stream:
                 self._wait_mla_event(kv_done_event)
                 kv.record_stream(torch.npu.current_stream())
@@ -1801,6 +1999,16 @@ class DeepseekV4Attention(nn.Module):
                 kv = _apply_partial_rotary(
                     kv.view(batch_size, seq_length, 1, self.head_dim), cos, sin, self.partial_slice
                 ).view(batch_size, seq_length, self.head_dim)
+    
+        win_kv_updated = False
+        if not is_prefill:
+            with _profile_timer(self.layer_idx, "cache_update"):
+                self.scatter_nd_update(
+                    attn_inputs["win_kv_cache"].view(-1, self.head_dim),
+                    attn_inputs["win_slot_mapping"].reshape(-1, 1),
+                    kv.reshape(-1, self.head_dim),
+                )
+            win_kv_updated = True
 
         if past_key_values is None:
             raise ValueError("Paged Attention requires a PagedDummyCache instance.")
@@ -1811,44 +2019,10 @@ class DeepseekV4Attention(nn.Module):
                 o = self._attn_post(o, position_embeddings, attn_inputs=attn_inputs, q_lens=q_lens)
             return o, None
 
-        cmp_sparse_indices = None
-        compressor_done_event = None
         if self.sfa_compressor is not None:
-            start_pos = attn_inputs["start_pos"]
-            seq_used_q = attn_inputs["seq_used_q"]
-            cmp_rope_position_ids = attn_inputs["cmp_rope_position_ids"]
-            state_block_table = attn_inputs["state_block_table"]
-            cmp_slot_mapping = attn_inputs["cmp_slot_mapping"]
-            sfa_state_cache = attn_inputs["sfa_state_cache"]
-            cmp_cache = attn_inputs["cmp_kv_cache"]
-            cmp_cos, cmp_sin = self.compress_rotary_emb(hidden_states, cmp_rope_position_ids)
-            if self._use_compressor_multi_stream(is_prefill):
-                compressor_done_event = self._launch_sfa_compressor(
-                    hidden_states,
-                    cmp_cos,
-                    cmp_sin,
-                    sfa_state_cache,
-                    state_block_table,
-                    cu_seqlens_q,
-                    seq_used_q,
-                    start_pos,
-                    cmp_cache,
-                    cmp_slot_mapping,
-                )
-            else:
+            if compressor_done_event is None:
                 with _profile_timer(self.layer_idx, "compressor"):
-                    self._run_sfa_compressor(
-                        hidden_states,
-                        cmp_cos,
-                        cmp_sin,
-                        sfa_state_cache,
-                        state_block_table,
-                        cu_seqlens_q,
-                        seq_used_q,
-                        start_pos,
-                        cmp_cache,
-                        cmp_slot_mapping,
-                    )
+                    self._run_sfa_compressor(*sfa_compressor_args)
 
             if self.indexer is not None:
                 if is_prefill:
@@ -1857,6 +2031,17 @@ class DeepseekV4Attention(nn.Module):
                     )
                 else:
                     indexer_seq_lens = _context_lens.to(dtype=torch.int32) + q_lens
+                precomputed_indexer_query_quant = None
+                precomputed_indexer_query_quant_event = None
+                if precomputed_indexer_query is not None:
+                    precomputed_indexer_query_quant, precomputed_indexer_query_quant_event = (
+                        self._launch_indexer_query_quant(
+                            precomputed_indexer_query,
+                            precomputed_indexer_query_event,
+                            compressor_done_event,
+                            is_prefill,
+                        )
+                    )
                 with _profile_timer(self.layer_idx, "indexer"):
                     cmp_sparse_indices = self.indexer.forward(
                         hidden_states, qa, cos, sin,
@@ -1867,10 +2052,17 @@ class DeepseekV4Attention(nn.Module):
                         state_block_table=state_block_table,
                         seq_used_q=q_lens,
                         attn_inputs=attn_inputs,
+                        precomputed_query=precomputed_indexer_query,
+                        precomputed_query_event=precomputed_indexer_query_event,
+                        precomputed_query_quant=precomputed_indexer_query_quant,
+                        precomputed_query_quant_event=precomputed_indexer_query_quant_event,
                     )
 
         if self._is_c1a:
-            o = self._c1a_attention(q, kv, past_key_values, _context_lens, is_prefill, q_lens, attn_inputs)
+            o = self._c1a_attention(
+                q, kv, past_key_values, _context_lens, is_prefill, q_lens, attn_inputs,
+                win_kv_updated=win_kv_updated,
+            )
         else:
             o = self._sparse_attention(
                 q,
@@ -1882,6 +2074,7 @@ class DeepseekV4Attention(nn.Module):
                 q_lens,
                 attn_inputs,
                 compressor_done_event=compressor_done_event,
+                win_kv_updated=win_kv_updated,
             )
 
         with _profile_timer(self.layer_idx, "attention_post"):
@@ -1984,7 +2177,7 @@ class DeepseekV4Attention(nn.Module):
         return o.view(batch_size, seq_length, self.num_heads, self.head_dim)
 
     def _c1a_attention(self, q, kv, past_key_values, context_lens, is_prefill: bool,
-                       q_lens: torch.Tensor, attn_inputs=None):
+                       q_lens: torch.Tensor, attn_inputs=None, win_kv_updated: bool = False):
         batch_size, seq_length = q.shape[:2]
         q_padded = q.contiguous().view(-1, self.num_heads, self.head_dim)
         q_lens = attn_inputs["q_lens"]
@@ -1999,13 +2192,16 @@ class DeepseekV4Attention(nn.Module):
                 kv_cache, block_tables = self._prepare_prefill_ori_kv(
                     kv, attn_inputs
                 )
-        else:
+        elif not win_kv_updated:
             kv_flat = kv.reshape(-1, self.head_dim)
             self.scatter_nd_update(
                 attn_inputs["win_kv_cache"].view(-1, self.head_dim),
                 attn_inputs["win_slot_mapping"].reshape(-1, 1),
                 kv_flat,
             )
+            kv_cache = attn_inputs["win_kv_cache"]
+            block_tables = attn_inputs["win_block_table"]
+        else:
             kv_cache = attn_inputs["win_kv_cache"]
             block_tables = attn_inputs["win_block_table"]
         sas_metadata = attn_inputs.get("sas_metadata")
@@ -2017,7 +2213,7 @@ class DeepseekV4Attention(nn.Module):
 
     def _sparse_attention(self, q, kv, past_key_values, context_lens, cmp_sparse_indices=None,
                           is_prefill: bool = True, q_lens: Optional[torch.Tensor] = None,
-                          attn_inputs=None, compressor_done_event=None):
+                          attn_inputs=None, compressor_done_event=None, win_kv_updated: bool = False):
         batch_size, seq_length = q.shape[:2]
         q_padded = q.contiguous().view(-1, self.num_heads, self.head_dim)
         q_lens = attn_inputs["q_lens"]
@@ -2032,13 +2228,16 @@ class DeepseekV4Attention(nn.Module):
                 kv_cache, block_tables = self._prepare_prefill_ori_kv(
                     kv, attn_inputs
                 )
-        else:
+        elif not win_kv_updated:
             kv_flat = kv.reshape(-1, self.head_dim)
             self.scatter_nd_update(
                 attn_inputs["win_kv_cache"].view(-1, self.head_dim),
                 attn_inputs["win_slot_mapping"].reshape(-1, 1),
                 kv_flat,
             )
+            kv_cache = attn_inputs["win_kv_cache"]
+            block_tables = attn_inputs["win_block_table"]
+        else:
             kv_cache = attn_inputs["win_kv_cache"]
             block_tables = attn_inputs["win_block_table"]
         cmp_kv_cache = attn_inputs["cmp_kv_cache"]
@@ -2258,7 +2457,9 @@ class DeepseekV4MoE(nn.Module):
     def _use_moe_multi_stream(self) -> bool:
         return self.enable_moe_multi_stream and self.ep_size > 1 and self.ep_group is not None
 
-    def _ensure_moe_multi_stream(self):
+    def _ensure_moe_multi_stream(self, shared_expert_stream=None):
+        if shared_expert_stream is not None:
+            self.shared_expert_stream = shared_expert_stream
         if self.shared_expert_stream is None:
             self.shared_expert_stream = _get_global_moe_shared_expert_stream()
         if self.shared_expert_ready_event is None:
@@ -2267,8 +2468,12 @@ class DeepseekV4MoE(nn.Module):
             self.shared_expert_done_event = torch.npu.Event()
         return self.shared_expert_stream, self.shared_expert_ready_event, self.shared_expert_done_event
 
-    def _launch_shared_expert(self, hidden_states_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.npu.Event]:
-        shared_stream, ready_event, done_event = self._ensure_moe_multi_stream()
+    def _launch_shared_expert(
+        self,
+        hidden_states_flat: torch.Tensor,
+        shared_expert_stream=None,
+    ) -> Tuple[torch.Tensor, torch.npu.Event]:
+        shared_stream, ready_event, done_event = self._ensure_moe_multi_stream(shared_expert_stream)
         main_stream = torch.npu.current_stream()
         ready_event.record(main_stream)
         with torch.npu.stream(shared_stream):
@@ -2320,15 +2525,24 @@ class DeepseekV4MoE(nn.Module):
         topk_weight = topk_weight * self.routed_scaling_factor
         return topk_idx.to(torch.int32), topk_weight
 
-    def forward(self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor] = None,
-                is_prefill: bool = True, cur_topk_list: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+        is_prefill: bool = True,
+        cur_topk_list: Optional[torch.Tensor] = None,
+        shared_expert_stream=None,
+    ) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, self.hidden_size).to(torch.bfloat16)
         if input_ids is not None:
             input_ids = input_ids.reshape(-1).contiguous()
 
         if self.n_shared_experts > 0 and self._use_moe_multi_stream():
-            shared_out_flat, shared_expert_event = self._launch_shared_expert(hidden_states_flat)
+            shared_out_flat, shared_expert_event = self._launch_shared_expert(
+                hidden_states_flat,
+                shared_expert_stream=shared_expert_stream,
+            )
         else:
             if self.n_shared_experts > 0:
                 shared_out_flat = self.shared_experts(hidden_states_flat).to(torch.bfloat16)
@@ -2498,6 +2712,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.ffn_norm = MojoRMSNorm(config.hidden_size, config.rms_norm_eps, dtype=torch.bfloat16)
         self.hc_pre = MojoHcPre()
         self.hc_post = MojoHcPost()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2512,6 +2727,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         attn_inputs: Optional[dict] = None,
         attn_metadata: Optional[dict] = None,
         cur_topk_list: Optional[torch.Tensor] = None,
+        shared_expert_stream=None,
         **kwargs,
     ) -> torch.Tensor:
         if _DSV4_LAYER_PROFILE:
@@ -2558,6 +2774,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids=input_ids,
                 is_prefill=is_prefill,
                 cur_topk_list=cur_topk_list,
+                shared_expert_stream=shared_expert_stream,
             )
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
@@ -2579,6 +2796,11 @@ class DeepseekV4Model(nn.Module):
         self.attn_tp_size = int(self.parallel_config.get("attn_tp_size", 1))
         self.o_proj_tp_size = int(self.parallel_config.get("o_proj_tp_size", self.attn_tp_size))
         self.hccl_comm_dict = {}
+        self.shared_expert_stream = (
+            _get_global_moe_shared_expert_stream()
+            if os.getenv("MOJO_MOE_MULTI_STREAM", "0") == "1"
+            else None
+        )
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
@@ -2679,6 +2901,11 @@ class DeepseekV4Model(nn.Module):
                 attn_metadata=attn_metadata,
                 q_lens=q_lens,
                 cur_topk_list=cur_topk_list,
+                shared_expert_stream=(
+                    attn_metadata.get("shared_expert_stream", self.shared_expert_stream)
+                    if attn_metadata is not None
+                    else self.shared_expert_stream
+                ),
             )
 
         hidden_states = self._hc_head(hidden_states)

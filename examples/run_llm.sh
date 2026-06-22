@@ -123,6 +123,8 @@ export MOJO_DISABLE_ASSERTION_REWRITE="${MOJO_DISABLE_ASSERTION_REWRITE:-1}"
 export MOJO_MOE_MULTI_STREAM="${MOJO_MOE_MULTI_STREAM:-1}"
 export MOJO_ATTN_MLA_MULTI_STREAM="${MOJO_ATTN_MLA_MULTI_STREAM:-1}"
 export MOJO_ATTN_COMPRESSOR_MULTI_STREAM="${MOJO_ATTN_COMPRESSOR_MULTI_STREAM:-1}"
+export MOJO_ATTN_INDEXER_MULTI_STREAM="${MOJO_ATTN_INDEXER_MULTI_STREAM:-1}"
+export MOJO_SKIP_GUARD_EVAL_AFTER_WARMUP="${MOJO_SKIP_GUARD_EVAL_AFTER_WARMUP:-1}"
 
 EP_SIZE="${EP_SIZE:-8}"
 CP_SIZE="${CP_SIZE:-${EP_SIZE}}"
@@ -152,7 +154,7 @@ fi
 cd "$PROJECT_ROOT" || exit 1
 
 if [ "$EP_SIZE" -eq 1 ]; then
-    echo "EP=1, CP=${CP_SIZE}, ATTN_TP=${ATTN_TP_SIZE}, LMHEAD_TP=${LMHEAD_TP_SIZE}, O_PROJ_TP=${O_PROJ_TP_SIZE}, use_parallelize_module_tp=${MOJO_USE_PARALLELIZE_MODULE_TP}, use_parallelize_module_ep=${MOJO_USE_PARALLELIZE_MODULE_EP}, batch_size=${BATCH_SIZE}, next_n=${NEXT_N}, use_attn_metadata=${USE_ATTN_METADATA}, build_legacy_attn_inputs=${MOJO_BUILD_LEGACY_ATTN_INPUTS}, moe_multi_stream=${MOJO_MOE_MULTI_STREAM}, attn_mla_multi_stream=${MOJO_ATTN_MLA_MULTI_STREAM}, attn_compressor_multi_stream=${MOJO_ATTN_COMPRESSOR_MULTI_STREAM}"
+    echo "EP=1, CP=${CP_SIZE}, ATTN_TP=${ATTN_TP_SIZE}, LMHEAD_TP=${LMHEAD_TP_SIZE}, O_PROJ_TP=${O_PROJ_TP_SIZE}, use_parallelize_module_tp=${MOJO_USE_PARALLELIZE_MODULE_TP}, use_parallelize_module_ep=${MOJO_USE_PARALLELIZE_MODULE_EP}, batch_size=${BATCH_SIZE}, next_n=${NEXT_N}, use_attn_metadata=${USE_ATTN_METADATA}, build_legacy_attn_inputs=${MOJO_BUILD_LEGACY_ATTN_INPUTS}, moe_multi_stream=${MOJO_MOE_MULTI_STREAM}, attn_mla_multi_stream=${MOJO_ATTN_MLA_MULTI_STREAM}, attn_compressor_multi_stream=${MOJO_ATTN_COMPRESSOR_MULTI_STREAM}, attn_indexer_multi_stream=${MOJO_ATTN_INDEXER_MULTI_STREAM}, skip_guard_eval_after_warmup=${MOJO_SKIP_GUARD_EVAL_AFTER_WARMUP}"
     ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}" \
     "${PYTHON_BIN}" -m examples.llm_inference \
         --model_path "${MODEL_PATH}" \
@@ -174,7 +176,7 @@ if [ "$EP_SIZE" -eq 1 ]; then
         --use_parallelize_module_tp "${MOJO_USE_PARALLELIZE_MODULE_TP}" \
         --use_parallelize_module_ep "${MOJO_USE_PARALLELIZE_MODULE_EP}"
 else
-    echo "EP=${EP_SIZE}, CP=${CP_SIZE}, ATTN_TP=${ATTN_TP_SIZE}, LMHEAD_TP=${LMHEAD_TP_SIZE}, O_PROJ_TP=${O_PROJ_TP_SIZE}, use_parallelize_module_tp=${MOJO_USE_PARALLELIZE_MODULE_TP}, use_parallelize_module_ep=${MOJO_USE_PARALLELIZE_MODULE_EP}, multi-card inference, batch_size=${BATCH_SIZE}, next_n=${NEXT_N}, use_attn_metadata=${USE_ATTN_METADATA}, build_legacy_attn_inputs=${MOJO_BUILD_LEGACY_ATTN_INPUTS}, moe_multi_stream=${MOJO_MOE_MULTI_STREAM}, attn_mla_multi_stream=${MOJO_ATTN_MLA_MULTI_STREAM}, attn_compressor_multi_stream=${MOJO_ATTN_COMPRESSOR_MULTI_STREAM}"
+    echo "EP=${EP_SIZE}, CP=${CP_SIZE}, ATTN_TP=${ATTN_TP_SIZE}, LMHEAD_TP=${LMHEAD_TP_SIZE}, O_PROJ_TP=${O_PROJ_TP_SIZE}, use_parallelize_module_tp=${MOJO_USE_PARALLELIZE_MODULE_TP}, use_parallelize_module_ep=${MOJO_USE_PARALLELIZE_MODULE_EP}, multi-card inference, batch_size=${BATCH_SIZE}, next_n=${NEXT_N}, use_attn_metadata=${USE_ATTN_METADATA}, build_legacy_attn_inputs=${MOJO_BUILD_LEGACY_ATTN_INPUTS}, moe_multi_stream=${MOJO_MOE_MULTI_STREAM}, attn_mla_multi_stream=${MOJO_ATTN_MLA_MULTI_STREAM}, attn_compressor_multi_stream=${MOJO_ATTN_COMPRESSOR_MULTI_STREAM}, attn_indexer_multi_stream=${MOJO_ATTN_INDEXER_MULTI_STREAM}, skip_guard_eval_after_warmup=${MOJO_SKIP_GUARD_EVAL_AFTER_WARMUP}"
 
     MA_NUM_GPUS="$EP_SIZE"
 
