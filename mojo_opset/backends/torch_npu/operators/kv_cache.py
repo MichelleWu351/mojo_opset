@@ -1,4 +1,5 @@
 from typing import Tuple
+from typing import Optional
 
 import torch
 import torch_npu
@@ -75,13 +76,14 @@ class TorchNpuStorePagedKVCache(MojoStorePagedKVCache, default_priority=0):
         block_table: torch.Tensor,
         cu_q_lens: torch.Tensor,
         context_kv_lens: torch.Tensor,
+        chunk_metadata: Optional[torch.Tensor] = None,   #torch_npu does not support chunk_metadata yet
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         total_tokens = key_states.shape[0]
         kv_heads = key_states.shape[1]
         head_dim = key_states.shape[2]
         block_size = key_cache.shape[2]
 
-        assert_paged_kv_store_contract(block_table, cu_q_lens, context_kv_lens)
+        assert_paged_kv_layout_contract(block_table, cu_q_lens, context_kv_lens)
 
         slot_mapping = _build_slot_mapping(
             block_table, cu_q_lens, context_kv_lens, block_size, total_tokens,

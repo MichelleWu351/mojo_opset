@@ -191,13 +191,27 @@ def test_store_paged_kv(batch_size, kv_heads, head_dim, block_size, context_kv_l
         case["v_cache"].clone(),
         chunk_metadata=case["chunk_metadata"],
     )
-    k_cache, v_cache = store_paged_kv(
-        case["key_states"],
-        case["value_states"],
-        case["k_cache"].clone(),
-        case["v_cache"].clone(),
-        chunk_metadata=case["chunk_metadata"],
-    )
+    ## torch_npu does not support chunk_metadata
+    from  mojo_opset.backends.torch_npu.operators.kv_cache import TorchNpuStorePagedKVCache
+    if isinstance(store_paged_kv,TorchNpuStorePagedKVCache):
+        k_cache, v_cache = store_paged_kv(
+            case["key_states"],
+            case["value_states"],
+            case["k_cache"].clone(),
+            case["v_cache"].clone(),
+            case["block_table"],
+            case["cu_q_lens"],
+            case["context_kv_lens"],
+            chunk_metadata=None,
+        )
+    else:
+        k_cache, v_cache = store_paged_kv(
+            case["key_states"],
+            case["value_states"],
+            case["k_cache"].clone(),
+            case["v_cache"].clone(),
+            chunk_metadata=case["chunk_metadata"],
+        )
 
     assert_close(k_cache, k_cache_ref)
     assert_close(v_cache, v_cache_ref)

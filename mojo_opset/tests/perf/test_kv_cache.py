@@ -73,16 +73,33 @@ def test_store_paged_kv(batch_size, kv_heads, head_dim, block_size, context_kv_l
     v_cache = v_cache_ref.clone()
 
     store_paged_kv = MojoStorePagedKVCache()
-
-    perf(  # noqa: F821
+    from  mojo_opset.backends.torch_npu.operators.kv_cache import TorchNpuStorePagedKVCache
+    if isinstance(store_paged_kv,TorchNpuStorePagedKVCache):
+        perf(  
         lambda: store_paged_kv(
             key_states,
             value_states,
             k_cache,
             v_cache,
-            chunk_metadata=chunk_metadata,
+            block_table,
+            cu_q_lens,
+            context_kv_lens,
+            chunk_metadata=None,
         )
     )
+    else:
+        perf(  
+        lambda: store_paged_kv(
+            key_states,
+            value_states,
+            k_cache,
+            v_cache,
+            chunk_metadata=None,
+        )
+    )
+        
+    
+    
 
 @auto_switch_platform(set_perf=True)
 @bypass_not_implemented
