@@ -176,16 +176,12 @@ def generate_paged_prefill_data_swa(
     dtype: torch.dtype,
 ):
     torch.manual_seed(43)
-    # q_lens = torch.randint(max_q_len // 2, max_q_len, (batch_size,), dtype=torch.int32)
     if max_q_len > 0:
         q_lens = torch.randint(max_q_len // 2, max_q_len, (batch_size,), dtype=torch.int32)
         q_lens = torch.clamp(q_lens, min=1)
     else:
         # max_q_len = 0 for testing padding logic, use randperm to generate a list with 0
         q_lens = torch.randperm(batch_size, dtype=torch.int32)
-    # cu_q_lens = torch.cat([torch.tensor([0], dtype=torch.int32), torch.cumsum(q_lens, 0, dtype=torch.int32)])
-
-    # q_lens = torch.clamp(q_lens, min=1)
     cu_q_lens = torch.cat([torch.tensor([0], dtype=torch.int32), torch.cumsum(q_lens, 0, dtype=torch.int32)])
 
     if max_kv_computed_len <= 0:
@@ -194,6 +190,7 @@ def generate_paged_prefill_data_swa(
     else:
         kv_cache_lens = torch.randint(max_kv_computed_len // 2, max_kv_computed_len, (batch_size,), dtype=torch.int32)
         kv_lens = q_lens + kv_cache_lens
+        kv_lens = torch.where(q_lens > 0, kv_lens, torch.zeros_like(kv_lens))
     cu_total_seq_lens = torch.cat([torch.tensor([0], dtype=torch.int32), torch.cumsum(kv_lens, 0, dtype=torch.int32)])
 
     total_q_tokens = cu_q_lens[-1].item()
@@ -240,10 +237,10 @@ def generate_paged_prefill_data_swa(
             k_cache[physical_block_id, :, :tokens_in_block, :] = k_slice
             v_cache[physical_block_id, :, :tokens_in_block, :] = v_slice
 
-    cu_total_seq_lens = None if kv_cache_lens is None else torch.cat(
-        [torch.tensor([0], dtype=torch.int32), torch.cumsum(kv_lens, 0).to(torch.int32)]
-    )
-    return query, k_cache, v_cache, cu_q_lens, block_tables, cu_total_seq_lens
+    cu_total_seq_lens = None if kv_cache_lens is None else cu_total_seq_lens
+    max_q_len = int((cu_q_lens[1:] - cu_q_lens[:-1]).max().item()) if cu_q_lens.numel() > 1 else 0
+    max_total_seq_len = int(kv_lens.max().item()) if kv_lens.numel() > 0 else 0
+    return query, k_cache, v_cache, cu_q_lens, block_tables, cu_total_seq_lens, max_q_len, max_total_seq_len
 
 
 
@@ -429,16 +426,14 @@ def test_sdpa(
 test_configs_swa_prefill = [
     (2, 16, 4, 128, 1024, 0, 32, torch.bfloat16, "M_BF16"),
     (2, 16, 4, 128, 2048, 0, 128, torch.bfloat16, "M_BF16_PADDIM"),
-    (2, 8, 1, 128, 256, 0, 128, torch.bfloat16, "M_BF16_WITH_CACHE"), # ascendC only support KV_COMPUTED_LEN == 0
-    (2, 8, 1, 128, 1024, 0, 1024, torch.bfloat16, "M_BF16_BIGPAGE"), # ascendC only support KV_COMPUTED_LEN == 0
+    (2, 8, 1, 128, 256, 1024, 128, torch.bfloat16, "M_BF16_WITH_CACHE"),
+    (2, 8, 1, 128, 1024, 2048, 1024, torch.bfloat16, "M_BF16_BIGPAGE"),
     (2, 8, 1, 128, 0, 0, 1024, torch.bfloat16, "M_BF16_PADSEQ"),
     (2, 8, 2, 128, 2048, 0, 1024, torch.bfloat16, "M_BF16_GROUP1"),
-    (2, 24, 8, 128, 1024, 0, 1024, torch.bfloat16, "M_BF16_GROUP2"), # ascendC only support KV_COMPUTED_LEN == 0
+    (2, 24, 8, 128, 1024, 1024, 1024, torch.bfloat16, "M_BF16_GROUP2"),
 ]
-
-
 @pytest.mark.parametrize(
-    "query, k_cache, v_cache, cu_q_lens, block_tables, cu_total_seq_lens",
+    "query, k_cache, v_cache, cu_q_lens, block_tables, cu_total_seq_lens, max_q_len, max_total_seq_len",
     [
         pytest.param(
             *generate_paged_prefill_data_swa(
@@ -457,7 +452,8 @@ test_configs_swa_prefill = [
     ],
 )
 @pytest.mark.parametrize("gqa_layout, global_window, local_window", [
-    ("AABB", 4, 1023), # ascendC default support "AABB" for kv_head layout
+    ("AABB", 4, 255),  #torch_npu only support AABB gqa layout
+    ("AABB", 4, 1023),
 ])
 @auto_switch_platform(set_perf=True)
 @bypass_not_implemented
@@ -469,28 +465,31 @@ def test_paged_prefill_swa(
     block_tables: torch.Tensor,
     gqa_layout: str,
     cu_total_seq_lens: Optional[torch.Tensor],
+    max_q_len: int,
+    max_total_seq_len: int,
     global_window: int,
     local_window: int,
 ):
     swa_prefill = MojoPagedPrefillSWA(
         is_causal=True,
         gqa_layout=gqa_layout,
-        global_window_size=global_window,
         local_window_size=local_window,
+        global_window_size=global_window,
     )
-
     head_dim = query.shape[-1]
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    perf(  # noqa: F821
+    perf(
         lambda: swa_prefill(
-            query,
-            k_cache,
-            v_cache,
-            cu_q_lens,
-            block_tables,
-            softmax_scale=softmax_scale,
-            cu_total_seq_lens=cu_total_seq_lens,
+        query,
+        k_cache,
+        v_cache,
+        cu_q_lens,
+        block_tables,
+        softmax_scale=softmax_scale,
+        cu_total_seq_lens=cu_total_seq_lens,
+        max_q_len=max_q_len,
+        max_total_seq_len=max_total_seq_len,
         )
     )
 

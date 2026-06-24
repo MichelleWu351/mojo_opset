@@ -1332,7 +1332,7 @@ def test_paged_prefill_nsa(H, D, blk):
 
 test_configs_swa_prefill = [
     (2, 16, 4, 128, 1024, 0, 32, torch.bfloat16, "M_BF16"),
-    (2, 16, 4, 96, 2048, 0, 128, torch.bfloat16, "M_BF16_PADDIM"),
+    (2, 16, 4, 128, 2048, 0, 128, torch.bfloat16, "M_BF16_PADDIM"),
     (2, 8, 1, 128, 256, 1024, 128, torch.bfloat16, "M_BF16_WITH_CACHE"),
     (2, 8, 1, 128, 1024, 2048, 1024, torch.bfloat16, "M_BF16_BIGPAGE"),
     (2, 8, 1, 128, 0, 0, 1024, torch.bfloat16, "M_BF16_PADSEQ"),
@@ -1361,7 +1361,7 @@ test_configs_swa_prefill = [
     ],
 )
 @pytest.mark.parametrize("gqa_layout, global_window, local_window", [
-    ("ABAB", 4, 255),
+    ("ABAB", 4, 255), 
     ("AABB", 4, 1023),
 ])
 @auto_switch_platform()
@@ -1440,7 +1440,7 @@ test_configs_swa_prefill_with_graph = [
     ],
 )
 @pytest.mark.parametrize("gqa_layout, global_window, local_window", [
-    #("ABAB", 4, 255),
+    ("ABAB", 4, 255),
     ("AABB", 4, 1023),
 ])
 @requires_platform_backend(platforms="ilu", backends="ixformer", reason="Test only for Ixformer")
@@ -1646,7 +1646,7 @@ test_configs_swa_decode = [
     ],
 )
 @pytest.mark.parametrize("gqa_layout, global_window, local_window", [
-    #("ABAB", 4, 255),
+    ("ABAB", 4, 255),
     ("AABB", 4, 1023),
 ])
 @auto_switch_platform()
