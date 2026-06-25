@@ -83,20 +83,56 @@ class IxformerAllGatherQuantGemm(MojoAllGatherQuantGemm):
 
         if dist.is_available() and dist.is_initialized():
             seq_local = input.shape[0]
-            if seq_local % 256 != 0:
-                raise NotImplementedError(
-                    "IxformerAllGatherQuantGemm requires local sequence length divisible by BM=256"
-                )
+            BM = 256
+            pad = (-seq_local) % BM  # 0 if already aligned, else rows to append
 
-            return ixf_f.allgather_quant_matmul(
-                input,
+            if pad > 0:
+                # Pad input on the seq dim and matching positions in scale.
+                # Each rank pads its own local segment; after all-gather the
+                # global output is sliced back to the unpadded layout below.
+                input_padded = torch.zeros(
+                    seq_local + pad, self.in_features,
+                    dtype=input.dtype, device=input.device,
+                )
+                input_padded[:seq_local].copy_(input)
+
+                scale_flat = input_scale.reshape(-1)
+                if scale_flat.numel() == seq_local:
+                    scale_padded = torch.zeros(
+                        seq_local + pad,
+                        dtype=scale_flat.dtype, device=scale_flat.device,
+                    )
+                    scale_padded[:seq_local].copy_(scale_flat)
+                else:
+                    raise ValueError(
+                        f"input_scale must contain one scale per input row to pad, "
+                        f"got {scale_flat.numel()} for seq_local {seq_local}"
+                    )
+            else:
+                input_padded = input
+                scale_padded = input_scale.reshape(-1)
+
+            out = ixf_f.allgather_quant_matmul(
+                input_padded,
                 self.weight,
-                input_scale.reshape(-1),
+                scale_padded,
                 self.weight_scale.to(torch.float32),
                 workspace=self._workspace,
                 group=self.process_group,
                 format="NN",
             )
+
+            if pad > 0:
+                # out shape: (world_size * (seq_local + pad), out_features) with
+                # per-rank padding rows at [k*seq_padded + seq_local : (k+1)*seq_padded].
+                # Reshape to (world_size, seq_padded, out_features) and slice
+                # off the padding to recover (world_size * seq_local, out_features).
+                seq_padded = seq_local + pad
+                out_view = out.view(self.world_size, seq_padded, -1)
+                out = out_view[:, :seq_local, :].contiguous().view(
+                    self.world_size * seq_local, -1
+                )
+            return out
 
         return ixf_f.w8a8(
             input, self.weight, input_scale, self.weight_scale,
@@ -164,10 +200,6 @@ class IxformerQuantGemmReduceScatter(MojoQuantGemmReduceScatter):
                 raise ValueError(
                     f"seq_full {seq_full} must be divisible by world_size {world_size}"
                 )
-            if (seq_full // world_size) % 256 != 0:
-                raise NotImplementedError(
-                    "IxformerQuantGemmReduceScatter requires seq_full / world_size divisible by BM=256"
-                )
             if self.output_dtype != torch.bfloat16:
                 raise NotImplementedError(
                     "IxformerQuantGemmReduceScatter fused ixformer path only supports bfloat16 output dtype"
@@ -177,15 +209,54 @@ class IxformerQuantGemmReduceScatter(MojoQuantGemmReduceScatter):
                     f"input_scale must contain one scale per input row, got {input_scale.numel()} and {seq_full}"
                 )
 
-            return ixf_f.quant_matmul_reducescatter(
-                input,
+            seq_per_rank = seq_full // world_size
+            BM = 256
+            pad_per_rank = (-seq_per_rank) % BM  # rows to append per rank
+
+            if pad_per_rank > 0:
+                # Reduce-scatter splits the output by contiguous row blocks
+                # of length seq_per_rank. To keep each rank's slice aligned
+                # to BM, padding must be inserted between rank segments
+                # (not just appended at the tail). Reshape (world_size,
+                # seq_per_rank, ...), zero-pad along the per-rank axis, then
+                # flatten back.
+                seq_per_rank_padded = seq_per_rank + pad_per_rank
+                input_r = input.view(world_size, seq_per_rank, self.in_features)
+                input_padded = torch.zeros(
+                    world_size, seq_per_rank_padded, self.in_features,
+                    dtype=input.dtype, device=input.device,
+                )
+                input_padded[:, :seq_per_rank, :].copy_(input_r)
+                input_p = input_padded.view(
+                    world_size * seq_per_rank_padded, self.in_features
+                )
+
+                scale_r = input_scale.reshape(world_size, seq_per_rank)
+                scale_padded = torch.zeros(
+                    world_size, seq_per_rank_padded,
+                    dtype=input_scale.dtype, device=input_scale.device,
+                )
+                scale_padded[:, :seq_per_rank].copy_(scale_r)
+                scale_p = scale_padded.view(world_size * seq_per_rank_padded)
+            else:
+                input_p = input
+                scale_p = input_scale
+
+            out = ixf_f.quant_matmul_reducescatter(
+                input_p,
                 self.weight,
-                input_scale,
+                scale_p,
                 self.weight_scale,
                 workspace=self._workspace,
                 group=self.process_group,
                 format="NN"
             )
+
+            if pad_per_rank > 0:
+                # Per-rank output is (seq_per_rank_padded, out_features) with
+                # padding rows at the tail. Slice back to (seq_per_rank, out).
+                out = out[:seq_per_rank, :].contiguous()
+            return out
 
         partial = ixf_f.w8a8(
             input, self.weight, input_scale, self.weight_scale,
