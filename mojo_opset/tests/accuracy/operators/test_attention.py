@@ -44,14 +44,14 @@ def generate_paged_decode_data(
         query = torch.randn(batch_size, seq_len, num_q_heads, head_dim, dtype=dtype)
     else:
         query = torch.randn(batch_size, num_q_heads, head_dim, dtype=dtype)
-    if max_seq_len > 0:
-        total_seq_lens = torch.randint(0, max_seq_len, (batch_size,), dtype=torch.int32)
-    else:
-        total_seq_lens = torch.randperm(batch_size, dtype=torch.int32)
 
-    # the seqlens of kv cache must larger than seq_lens of query
     min_seq_len = seq_len if seq_len != -1 else 1
-    total_seq_lens = torch.clamp(total_seq_lens, min=min_seq_len)
+    if max_seq_len > 0:
+      total_seq_lens = torch.randint(0, max_seq_len, (batch_size,), dtype=torch.int32)
+      total_seq_lens = torch.clamp(total_seq_lens, min=min_seq_len)
+    else:
+      total_seq_lens = torch.randperm(batch_size, dtype=torch.int32)
+      total_seq_lens = torch.where(total_seq_lens == 0, 0, total_seq_lens + min_seq_len - 1)
 
     max_total_seq_len = total_seq_lens.max().item()
     max_num_blocks_per_seq = (max_total_seq_len + block_size - 1) // block_size

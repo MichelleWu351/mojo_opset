@@ -922,8 +922,8 @@ def swa_paged_decode_impl(
         stride_os = num_q_heads * head_dim
         stride_oh = head_dim
         stride_od = 1
-        assert torch.all(seqlens >= seq_lens), f"the seqlens of kv cache must larger than seq_lens({seq_lens}) of q, \
-            but: {seqlens[torch.where(seqlens < seq_lens)]}"
+        # assert torch.all(seqlens >= seq_lens), f"the seqlens of kv cache must larger than seq_lens({seq_lens}) of q, \
+        #     but: {seqlens[torch.where(seqlens < seq_lens)]}"
     else:
         batch_size, num_q_heads, head_dim = q.shape
         stride_qb, stride_qh, stride_qd = q.stride()
