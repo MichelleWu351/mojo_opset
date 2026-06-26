@@ -82,13 +82,8 @@ test_configs_decode = [
     (8, 8, 1, 128, 8192, 1024, torch.bfloat16, "M_BF16_LONG"),
     (8, 8, 1, 128, 2048, 1024, torch.bfloat16, "M_BF16_BIGPAGE"),
     (8, 8, 1, 128, 0, 1024, torch.bfloat16, "M_BF16_PADSEQ"),
-
-    # add perf case
-    (8, 16, 4, 128, 1024, 128, torch.bfloat16, "PERF_M_BF16_1"),
-    (8, 16, 4, 128, 1024, 256, torch.bfloat16, "PERF_M_BF16_2"),
-    (8, 16, 4, 128, 1024, 512, torch.bfloat16, "PERF_M_BF16_3"),
-    (8, 8, 1, 128, 8192, 128, torch.bfloat16, "PERF_M_BF16_PADSEQ"),
-    (8, 8, 1, 128, 8192, 512, torch.bfloat16, "PERF_M_BF16_LONG"),
+    (8, 8, 1, 128, 16384, 128, torch.bfloat16, "M_BF16_LONG_16384"),
+     (8, 8, 1, 128, 32768, 128, torch.bfloat16, "M_BF16_LONG_32768"),
 ]
 
 
@@ -437,10 +432,8 @@ test_configs_prefill = [
     (2, 8, 1, 128, 1024, 2048, 1024, torch.bfloat16, "M_BF16_BIGPAGE"),
     (2, 8, 1, 128, 0, 0, 1024, torch.bfloat16, "M_BF16_PADSEQ"),
 
-    # add perf case
-    (2, 16, 4, 128, 1024, 0, 128, torch.bfloat16, "PERF_M_BF16"),
-    (2, 16, 4, 128, 1024, 0, 256, torch.bfloat16, "PERF_M_BF16_PADDIM"),
-    (2, 16, 4, 128, 1024, 0, 512, torch.bfloat16, "PERF_M_BF16_WITH_CACHE"),
+     (2, 8, 1, 128, 16384, 8192, 128, torch.bfloat16, "M_BF16_WITH_CACHE_16384"),
+     (2, 8, 1, 128, 32768, 10240, 128, torch.bfloat16, "M_BF16_WITH_CACHE_32768"),
 ]
 
 
@@ -463,7 +456,7 @@ test_configs_prefill = [
         for B, Q_H, KV_H, D, Q_LEN, KV_COMPUTED_LEN, BLK_S, dtype, ID in test_configs_prefill
     ],
 )
-@pytest.mark.parametrize("gqa_layout", ["ABAB", "AABB"])
+@pytest.mark.parametrize("gqa_layout", ["ABAB","AABB"])
 @auto_switch_platform()
 @bypass_not_implemented
 def test_paged_prefill_gqa(

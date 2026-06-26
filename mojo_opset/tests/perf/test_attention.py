@@ -26,8 +26,11 @@ def generate_paged_decode_data(
 ):
     torch.manual_seed(43)
     query = torch.randn(batch_size, num_q_heads, head_dim, dtype=dtype)
-
-    total_seq_lens = torch.randint(1, max_seq_len, (batch_size,), dtype=torch.int32)
+    if max_seq_len > 0:
+        total_seq_lens = torch.randint(0, max_seq_len, (batch_size,), dtype=torch.int32)
+        total_seq_lens = torch.clamp(total_seq_lens, min=1)
+    else:
+        total_seq_lens = torch.randperm(batch_size, dtype=torch.int32)
 
     max_num_blocks_per_seq = (total_seq_lens.max().item() + block_size - 1) // block_size
     total_blocks_needed = int(torch.div(total_seq_lens + block_size - 1, block_size, rounding_mode="floor").sum().item())
@@ -59,11 +62,13 @@ def generate_paged_decode_data(
 
 
 test_configs_decode = [
-    (8, 16, 4, 128, 1024, 128, torch.bfloat16, "M_BF16"),
-    (8, 16, 4, 128, 1024, 256, torch.bfloat16, "M_BF16"),
-    (8, 16, 4, 128, 1024, 512, torch.bfloat16, "M_BF16"),
-    # (8, 16, 4, 96, 1024, 128, torch.bfloat16, "M_BF16_PADDIM"),
-    # (8, 8, 1, 128, 8192, 128, torch.bfloat16, "M_BF16_LONG"),
+    (8, 16, 4, 128, 1024, 32, torch.bfloat16, "M_BF16"),
+    (8, 16, 4, 128, 1024, 128, torch.bfloat16, "M_BF16_PADDIM"),
+    (8, 8, 1, 128, 8192, 1024, torch.bfloat16, "M_BF16_LONG"),
+    (8, 8, 1, 128, 2048, 1024, torch.bfloat16, "M_BF16_BIGPAGE"),
+    (8, 8, 1, 128, 0, 1024, torch.bfloat16, "M_BF16_PADSEQ"),
+    (8, 8, 1, 128, 16384, 128, torch.bfloat16, "M_BF16_LONG_16384"),
+    (8, 8, 1, 128, 32768, 128, torch.bfloat16, "M_BF16_LONG_32768"),
 ]
 
 
@@ -85,7 +90,7 @@ test_configs_decode = [
         for B, Q_H, KV_H, D, S_LEN, BLK_S, dtype, ID in test_configs_decode
     ],
 )
-@pytest.mark.parametrize("gqa_layout", ["ABAB", "AABB"])
+@pytest.mark.parametrize("gqa_layout", ["AABB"])
 @auto_switch_platform(set_perf=True)
 @bypass_not_implemented
 def test_paged_decode_gqa(
@@ -255,7 +260,12 @@ def generate_paged_prefill_data(
     dtype: torch.dtype,
 ):
     torch.manual_seed(43)
-    q_lens = torch.randint(max_q_len // 2, max_q_len, (batch_size,), dtype=torch.int32)
+    if max_q_len > 0:
+        q_lens = torch.randint(max_q_len // 2, max_q_len, (batch_size,), dtype=torch.int32)
+        q_lens = torch.clamp(q_lens, min=1)
+    else:
+        # max_q_len = 0 for testing padding logic, use randperm to generate a list with 0
+        q_lens = torch.randperm(batch_size, dtype=torch.int32)
     q_lens = torch.clamp(q_lens, min=1)
     cu_q_lens = torch.cat([torch.tensor([0], dtype=torch.int32), torch.cumsum(q_lens, 0, dtype=torch.int32)])
 
@@ -318,17 +328,15 @@ def generate_paged_prefill_data(
 
 
 test_configs_prefill = [
-    # (2, 16, 4, 128, 1024, 0, 32, torch.bfloat16, "M_BF16"),
-    # (2, 16, 4, 96, 1024, 0, 128, torch.bfloat16, "M_BF16_PADDIM"),
-    # (2, 8, 1, 128, 4096, 8192, 128, torch.bfloat16, "M_BF16_WITH_CACHE"),
+    (2, 16, 4, 128, 1024, 0, 32, torch.bfloat16, "M_BF16"),
+    (2, 16, 4, 128, 1024, 0, 128, torch.bfloat16, "M_BF16_PADDIM"),
+    (2, 8, 1, 128, 4096, 8192, 128, torch.bfloat16, "M_BF16_WITH_CACHE"),
+    (2, 8, 1, 128, 1024, 2048, 1024, torch.bfloat16, "M_BF16_BIGPAGE"),
+    (2, 8, 1, 128, 0, 0, 1024, torch.bfloat16, "M_BF16_PADSEQ"),
 
-    # =================Match torch_npu==============
-    (2, 16, 4, 128, 1024, 0, 128, torch.bfloat16, "PERF_M_BF16"),
-    (2, 16, 4, 128, 1024, 0, 256, torch.bfloat16, "PERF_M_BF16_PADDIM"),
-    (2, 16, 4, 128, 1024, 0, 512, torch.bfloat16, "PERF_M_BF16_WITH_CACHE"),
+     (2, 8, 1, 128, 16384, 0, 128, torch.bfloat16, "M_BF16_WITH_CACHE_16384"),
+     (2, 8, 1, 128, 32768, 0, 128, torch.bfloat16, "M_BF16_WITH_CACHE_32768"),
 ]
-
-
 @pytest.mark.parametrize(
     "query, k_cache, v_cache, cu_q_lens, block_tables, cu_total_seq_lens",
     [
@@ -348,7 +356,7 @@ test_configs_prefill = [
         for B, Q_H, KV_H, D, Q_LEN, KV_COMPUTED_LEN, BLK_S, dtype, ID in test_configs_prefill
     ],
 )
-@pytest.mark.parametrize("gqa_layout", ["ABAB", "AABB"])
+@pytest.mark.parametrize("gqa_layout", ["AABB"])
 @auto_switch_platform(set_perf=True)
 @bypass_not_implemented
 def test_paged_prefill_gqa(
