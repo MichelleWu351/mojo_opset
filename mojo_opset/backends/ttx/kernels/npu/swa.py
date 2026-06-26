@@ -44,7 +44,13 @@ def get_mask_causal_with_window(
         BLOCK_N: int,
         local_window_size: Optional[int] = None,
         global_window_size: Optional[int] = None,
+        device: str = "npu",
 ):
+    if local_window_size is None:
+        local_window_size = 0
+    if global_window_size is None:
+        global_window_size = 0
+
     M = global_window_size + local_window_size + 4 * max(BLOCK_M, BLOCK_N)
     N = global_window_size + local_window_size + 5 * max(BLOCK_M, BLOCK_N)
 
@@ -55,7 +61,8 @@ def get_mask_causal_with_window(
 
     local_band = torch.ones(M, N, dtype=torch.bool).triu(diagonal=-local_window_size)
 
-    return causal & (sink_band | local_band)
+    mask = causal & (sink_band | local_band)
+    return mask.to(device=device)
 
 
 import triton
@@ -1219,7 +1226,6 @@ def swa_paged_prefill_impl(
         local_window_size,
         global_window_size
     )
-    causal_mask = causal_mask.npu()
     causal_mask_m_size, causal_mask_n_size = causal_mask.shape
 
     use_swa_paged_prefill_kernel[grid](
