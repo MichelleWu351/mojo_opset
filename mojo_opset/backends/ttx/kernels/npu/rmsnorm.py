@@ -14,6 +14,7 @@ from mojo_opset.utils.misc import get_bool_env
 
 IS_DETERMINISTIC = get_bool_env("MOJO_DETERMINISTIC", default=False)
 COL_BLOCKING_THRESHOLD = 10240
+COL_BLOCKING_BWD_THRESHOLD = 2048
 
 _CASTING_MODE_NONE: tl.constexpr = tl.constexpr(-1)
 _CASTING_MODE_LLAMA: tl.constexpr = tl.constexpr(0)
@@ -21,7 +22,7 @@ _CASTING_MODE_GEMMA: tl.constexpr = tl.constexpr(1)
 
 TOKEN_BLOCK_SIZE_TABLE = {
     10240: 2,
-    8192: 4,
+    8192: 2,
     4096: 6,
     2048: 8,
     1024: 10,
@@ -464,7 +465,7 @@ def _rmsnorm_bwd_large_cols_kernel(
 
             if casting_mode_int == _CASTING_MODE_LLAMA:
                 m_chunk = (dY_chunk * W_chunk_offset[None, :]).to(tl.float32)
-                dW_chunk_sum = tl.sum(dY_chunk * normed_X_chunk.to(X_dtype), axis=0)
+                dW_chunk_sum = tl.sum(dY_chunk.to(tl.float32) * normed_X_chunk, axis=0)
             elif casting_mode_int == _CASTING_MODE_GEMMA:
                 dY_chunk_f32 = dY_chunk.to(tl.float32)
                 W_chunk_offset = W_chunk_offset.to(tl.float32)
@@ -557,7 +558,7 @@ def rmsnorm_bwd_impl(
 
     dX_2d = torch.empty_like(dY_2d)
 
-    if n_cols <= COL_BLOCKING_THRESHOLD:
+    if n_cols <= COL_BLOCKING_BWD_THRESHOLD:
         _dW = torch.zeros((num_programs, n_cols), dtype=torch.float32, device=W.device)
         _rmsnorm_bwd_kernel[grid](
             dY_2d,
@@ -602,8 +603,8 @@ def rmsnorm_bwd_impl(
             offset,
             casting_mode_int,
             X_dtype_triton,
-            BLOCK_SIZE_N=COL_BLOCKING_THRESHOLD,
-            BLOCK_SIZE_M=2,  # Empirical value
+            BLOCK_SIZE_N=COL_BLOCKING_BWD_THRESHOLD,
+            BLOCK_SIZE_M=2,
             IS_DETERMINISTIC=IS_DETERMINISTIC,
         )
 
