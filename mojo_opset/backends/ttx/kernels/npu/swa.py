@@ -1234,7 +1234,6 @@ def swa_paged_prefill_impl(
             limit_auto_multi_buffer_of_local_buffer="no-l0c",
             limit_auto_multi_buffer_buffer="no-limit",
             hfusion_enable_multiple_consumer_fusion=True,
-            enable_dynamic_cv_flow_opt=True,
             intra_cache_num=3,
             inter_cache_num=2,
         )

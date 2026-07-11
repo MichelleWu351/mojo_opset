@@ -10,88 +10,81 @@ from mojo_opset.backends.ttx.kernels.npu.utils import get_num_cores
 from mojo_opset.backends.ttx.kernels.utils import prepare_chunk_indices
 
 
-def load_balance_sorted_stride(
-        cu_q_lens: list,
-        kvlens: list,
+def _tensor_to_cpu_list(tensor: torch.Tensor) -> List[int]:
+    return [int(x) for x in tensor.detach().cpu().tolist()]
+
+
+def _build_lpt_task_schedule(
+        cu_q_lens: torch.Tensor,
+        seqlens_kv: Optional[torch.Tensor],
         num_q_heads: int,
-        n_programs: int,
-        BLOCK_M: int,
-        BLOCK_N: int,
-):
+        block_size_m: int,
+        block_size_n: int,
+        cube_num: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build a shape-aware static schedule for the 1D Triton grid.
+
+    Each task still computes one (batch, q block, q head). The estimated cost is
+    the number of KV blocks scanned by that task. LPT keeps the kernel free of
+    global atomics while avoiding the worst tail imbalance of round-robin.
     """
-    Sorted Round-Robin load balancing:
-    1. Enumerate all tasks and compute each task's workload
-    2. Sort tasks by workload in descending order
-    3. Round-robin assignment: sorted position i -> core i % n_programs
+    cu_q_lens_host = _tensor_to_cpu_list(cu_q_lens)
+    seqlens_kv_host = None if seqlens_kv is None else _tensor_to_cpu_list(seqlens_kv)
+    batch_size = len(cu_q_lens_host) - 1
 
-    After sorting, adjacent tasks have similar workload. Round-robin ensures
-    every core gets a uniform mix of high/low workload tasks, achieving better
-    balance than the original unsorted stride (opt).
+    weighted_tasks = []
+    seq_no = 0
+    for b_id in range(batch_size):
+        q_seq_len = cu_q_lens_host[b_id + 1] - cu_q_lens_host[b_id]
+        if q_seq_len <= 0:
+            continue
 
-    Returns:
-        task_tensor: (num_tasks, 5) [core_id, q_head_id, b_id, q_block_id, workload]
-        core_range_tensor: (n_programs, 2) [start_idx, end_idx]
-    """
-    num_seqs = len(cu_q_lens) - 1
+        kv_seq_len = q_seq_len if seqlens_kv_host is None else seqlens_kv_host[b_id]
+        kv_cache_len = kv_seq_len - q_seq_len
+        if kv_cache_len < 0:
+            raise ValueError(
+                f"seqlens_kv[{b_id}] ({kv_seq_len}) must be >= q_seq_len ({q_seq_len})"
+            )
 
-    # ---- Step 1: enumerate all tasks and compute workload ----
-    tasks = []  # (workload, q_head_id, b_id, q_block_id)
-    for b_id in range(num_seqs):
-        q_seq_len = cu_q_lens[b_id + 1] - cu_q_lens[b_id]
-        kv_seq_len = kvlens[b_id]
-        kv_computed_len = kv_seq_len - q_seq_len
-        num_q_chunks = (q_seq_len + BLOCK_M - 1) // BLOCK_M
-        for q_block_id in range(num_q_chunks):
-            q_block_start = q_block_id * BLOCK_M
-            q_block_end = min(q_block_start + BLOCK_M, q_seq_len)
-            q_block_len = q_block_end - q_block_start
-            num_total_blocks = (q_block_start + kv_computed_len + q_block_len + BLOCK_N - 1) // BLOCK_N
+        q_chunks = triton.cdiv(q_seq_len, block_size_m)
+        for q_block_id in range(q_chunks):
+            q_block_end = min((q_block_id + 1) * block_size_m, q_seq_len)
+            cost = max(1, triton.cdiv(kv_cache_len + q_block_end, block_size_n))
             for q_head_id in range(num_q_heads):
-                tasks.append((num_total_blocks, q_head_id, b_id, q_block_id))
+                kv_head_id = q_head_id // (num_q_heads // 4)
+                # weighted_tasks.append((cost, seq_no, b_id, q_block_id, q_head_id))
+                weighted_tasks.append((b_id, kv_head_id, q_block_id, cost, q_head_id, seq_no))
+                seq_no += 1
 
-    total_tasks = len(tasks)
+    heap = [(0, core_id) for core_id in range(cube_num)]
+    per_core_tasks: List[List[Tuple[int, int, int]]] = [[] for _ in range(cube_num)]
 
-    if total_tasks == 0:
-        task_tensor = torch.empty(0, 5, dtype=torch.long)
-        core_range_tensor = torch.empty(n_programs, 2, dtype=torch.long)
-        return task_tensor, core_range_tensor
+    for b_id, kv_head_id, q_block_id, cost, q_head_id, seq_no in sorted(weighted_tasks, reverse=True):
+        core_cost, core_id = heapq.heappop(heap)
+        per_core_tasks[core_id].append((b_id, q_head_id, q_block_id))
+        heapq.heappush(heap, (core_cost + cost, core_id))
 
-    # ---- Step 2: sort by workload in descending order ----
-    tasks.sort(key=lambda x: x[0], reverse=True)
+    task_b = []
+    task_q_block = []
+    task_q_head = []
+    core_task_offsets = [0]
+    for tasks in per_core_tasks:
+        # tasks.sort()
+        for b_id, q_head_id, q_block_id in tasks:
+            # task_b.append(b_id * 1024 * 12 + q_block_id * 12 + q_head_id)
+            task_b.append(b_id)
+            task_q_block.append(q_block_id)
+            task_q_head.append(q_head_id)
+        core_task_offsets.append(len(task_b))
+    # print(max(task_b), max(task_q_block), max(task_q_head))
 
-    # ---- Step 3: round-robin assignment (sorted stride) ----
-    core_tasks = [[] for _ in range(n_programs)]
-    for i, (workload, q_head_id, b_id, q_block_id) in enumerate(tasks):
-        core_id = i % n_programs
-        core_tasks[core_id].append([core_id, q_head_id, b_id, q_block_id, workload])
-
-    # ---- Step 4: pack into contiguous tensors ----
-    task_list = []
-    core_ranges = []
-    current_idx = 0
-    for core_id in range(n_programs):
-        start_idx = current_idx
-        for task in core_tasks[core_id]:
-            task_list.append(task)
-            current_idx += 1
-        end_idx = current_idx
-        core_ranges.append([start_idx, end_idx])
-
-    task_tensor = torch.tensor(task_list, dtype=torch.long)
-    core_range_tensor = torch.tensor(core_ranges, dtype=torch.long)
-
-    # ---- Print Load Balance Info ----
-    # core_workloads = [sum(t[4] for t in core_tasks[i]) for i in range(n_programs)]
-    # core_counts = [len(core_tasks[i]) for i in range(n_programs)]
-    # max_wl = max(core_workloads)
-    # min_wl = min(core_workloads)
-    # avg_wl = sum(core_workloads) / n_programs
-    # print(f"[SortedStride] Total task number: {total_tasks}, 核数: {n_programs}")
-    # print(f"[SortedStride] Task number per core: min={min(core_counts)}, max={max(core_counts)}")
-    # print(f"[SortedStride] Load per core: min={min_wl}, max={max_wl}, avg={avg_wl:.1f}, "
-    #       f"diff={max_wl - min_wl} ({(max_wl - min_wl) / avg_wl * 100:.1f}%)")
-
-    return task_tensor.npu(), core_range_tensor.npu()
+    device = cu_q_lens.device
+    return (
+        torch.tensor(task_b, device=device, dtype=torch.int32),
+        torch.tensor(task_q_block, device=device, dtype=torch.int32),
+        torch.tensor(task_q_head, device=device, dtype=torch.int32),
+        torch.tensor(core_task_offsets, device=device, dtype=torch.int32),
+    )
 
 
 @triton.jit
@@ -170,7 +163,10 @@ def paged_prefill_kernel(
     value_cache_ptr,
     o_ptr,
     aux_mask_ptr,
-    batch_size,
+    task_b_ptr,
+    task_q_block_ptr,
+    task_q_head_ptr,
+    core_task_offsets_ptr,
     cu_q_lens_ptr,
     seqlens_kv_ptr,
     block_tables_ptr,
@@ -193,8 +189,6 @@ def paged_prefill_kernel(
     stride_mask_m,
     stride_mask_n,
     softmax_scale,
-    core_tasks,  # (num_tasks, 5): [core_id, q_head_id, b_id, q_block_id, workload]
-    core_tasks_ranges,  # (n_programs, 2): [start_idx, end_idx]
     AUX_MASK_SIZE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
@@ -209,13 +203,14 @@ def paged_prefill_kernel(
 
     tl.static_assert(PAGE_SIZE % BLOCK_SIZE_N == 0, "BLOCK_SIZE_N must be a divisor of PAGE_SIZE")
 
-    task_start = tl.load(core_tasks_ranges + pid * 2)
-    task_end = tl.load(core_tasks_ranges + pid * 2 + 1)
+    task_begin = tl.load(core_task_offsets_ptr + pid)
+    task_end = tl.load(core_task_offsets_ptr + pid + 1)
 
-    for task_id in range(task_start, task_end):
-        q_head_id = tl.load(core_tasks + task_id * 5 + 1)
-        b_id = tl.load(core_tasks + task_id * 5 + 2)
-        q_block_id = tl.load(core_tasks + task_id * 5 + 3)
+    for task_idx in range(task_begin, task_end):
+        b_id = tl.load(task_b_ptr + task_idx)
+        q_block_id = tl.load(task_q_block_ptr + task_idx)
+        q_head_id = tl.load(task_q_head_ptr + task_idx)
+
         q_start_loc = tl.load(cu_q_lens_ptr + b_id).to(tl.int32)
         q_end_loc = tl.load(cu_q_lens_ptr + b_id + 1).to(tl.int32)
         q_seq_len = q_end_loc - q_start_loc
@@ -259,7 +254,8 @@ def paged_prefill_kernel(
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_D), dtype=tl.float32)
 
         num_kv_blocks = tl.cdiv(kv_cache_len + q_block_end_in_seq, BLOCK_SIZE_N)
-        for kv_block_id in range(0, num_kv_blocks):
+        num_no_mask_blocks = (kv_cache_len + q_block_start_in_seq) // BLOCK_SIZE_N
+        for kv_block_id in range(0, num_no_mask_blocks):
             kv_block_start_in_seq = kv_block_id * BLOCK_SIZE_N
             kv_block_end_in_seq = min(kv_block_start_in_seq + BLOCK_SIZE_N, kv_seq_len)
             kv_block_len = kv_block_end_in_seq - kv_block_start_in_seq
@@ -286,6 +282,35 @@ def paged_prefill_kernel(
                 block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_D),
                 order=(1, 0),
             )
+
+            acc, l_i, m_i = _sdpa_infer_single_block(
+                acc,
+                l_i,
+                m_i,
+                q,
+                K_T_block_ptr,
+                V_block_ptr,
+                softmax_scale,
+                None,
+                HEAD_DIM,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_D,
+                value_cache_ptr.dtype.element_ty == tl.float8e5,
+            )
+
+
+        for kv_block_id in range(num_no_mask_blocks, num_kv_blocks):
+            kv_block_start_in_seq = kv_block_id * BLOCK_SIZE_N
+            kv_block_end_in_seq = min(kv_block_start_in_seq + BLOCK_SIZE_N, kv_seq_len)
+            kv_block_len = kv_block_end_in_seq - kv_block_start_in_seq
+
+            logical_page_id = kv_block_start_in_seq // PAGE_SIZE
+            kv_block_start_in_page = kv_block_start_in_seq % PAGE_SIZE
+            physical_page_id = tl.load(
+                block_tables_ptr + b_id * stride_bt_batch + logical_page_id * stride_bt_block
+            )
+
             mask = causal_mask_fn(
                 aux_mask_ptr,
                 AUX_MASK_SIZE,
@@ -296,6 +321,24 @@ def paged_prefill_kernel(
                 BLOCK_SIZE_M,
                 BLOCK_SIZE_N,
             )
+
+            K_T_block_ptr = tl.make_block_ptr(
+                base=key_cache_ptr + physical_page_id * stride_k_block + kv_head_id * stride_k_head + kv_block_start_in_page * stride_k_blksz,
+                shape=(HEAD_DIM, kv_block_len),
+                strides=(stride_k_dim, stride_k_blksz),
+                offsets=(0, 0),
+                block_shape=(BLOCK_SIZE_D, BLOCK_SIZE_N),
+                order=(0, 1),
+            )
+            V_block_ptr = tl.make_block_ptr(
+                base=value_cache_ptr + physical_page_id * stride_v_block + kv_head_id * stride_v_head + kv_block_start_in_page * stride_v_blksz,
+                shape=(kv_block_len, HEAD_DIM),
+                strides=(stride_v_blksz, stride_v_dim),
+                offsets=(0, 0),
+                block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_D),
+                order=(1, 0),
+            )
+
 
             acc, l_i, m_i = _sdpa_infer_single_block(
                 acc,
@@ -329,6 +372,10 @@ def paged_prefill_page_aggregation_kernel(
     value_cache_ptr,
     o_ptr,
     aux_mask_ptr,
+    task_b_ptr,
+    task_q_block_ptr,
+    task_q_head_ptr,
+    core_task_offsets_ptr,
     batch_size,
     cu_q_lens_ptr,
     seqlens_kv_ptr,
@@ -352,8 +399,6 @@ def paged_prefill_page_aggregation_kernel(
     stride_mask_m,
     stride_mask_n,
     softmax_scale,
-    core_tasks,  # (num_tasks, 5): [core_id, q_head_id, b_id, q_block_id, workload]
-    core_tasks_ranges,  # (n_programs, 2): [start_idx, end_idx]
     AUX_MASK_SIZE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
@@ -367,13 +412,14 @@ def paged_prefill_page_aggregation_kernel(
 ):
     pid = tl.program_id(0)
 
-    task_start = tl.load(core_tasks_ranges + pid * 2)
-    task_end = tl.load(core_tasks_ranges + pid * 2 + 1)
+    task_begin = tl.load(core_task_offsets_ptr + pid)
+    task_end = tl.load(core_task_offsets_ptr + pid + 1)
 
-    for task_id in range(task_start, task_end):
-        q_head_id = tl.load(core_tasks + task_id * 5 + 1)
-        b_id = tl.load(core_tasks + task_id * 5 + 2)
-        q_block_id = tl.load(core_tasks + task_id * 5 + 3)
+    for task_idx in range(task_begin, task_end):
+        b_id = tl.load(task_b_ptr + task_idx)
+        q_block_id = tl.load(task_q_block_ptr + task_idx)
+        q_head_id = tl.load(task_q_head_ptr + task_idx)
+
         q_start_loc = tl.load(cu_q_lens_ptr + b_id).to(tl.int32)
         q_end_loc = tl.load(cu_q_lens_ptr + b_id + 1).to(tl.int32)
         q_seq_len = q_end_loc - q_start_loc
@@ -552,14 +598,15 @@ def paged_attention_prefill_impl(
     BLOCK_SIZE_N = min(128, triton.next_power_of_2(page_size))
     cube_num = get_num_cores("cube")
     grid = (cube_num,)
-    core_task, core_range_tensor = load_balance_sorted_stride(
-        cu_q_lens.tolist(),
-        seqlens_kv.tolist(),
+    task_b, task_q_block, task_q_head, core_task_offsets = _build_lpt_task_schedule(
+        cu_q_lens,
+        seqlens_kv,
         num_q_heads,
-        cube_num,
         CHUNK_SIZE,
         BLOCK_SIZE_N,
+        cube_num,
     )
+
     if not (page_size < 128 and 128 % page_size == 0):
         paged_prefill_kernel[grid](
             q,
@@ -567,7 +614,10 @@ def paged_attention_prefill_impl(
             value_cache,
             o,
             aux_mask,
-            batch_size,
+            task_b,
+            task_q_block,
+            task_q_head,
+            core_task_offsets,
             cu_q_lens,
             seqlens_kv,
             block_tables.to(torch.int32),
@@ -590,8 +640,6 @@ def paged_attention_prefill_impl(
             aux_mask.stride(0),
             aux_mask.stride(1),
             softmax_scale,
-            core_task,
-            core_range_tensor,
             aux_mask.shape[0],
             page_size,
             num_q_heads,
@@ -603,7 +651,6 @@ def paged_attention_prefill_impl(
             BLOCK_SIZE_D=head_dim,
             limit_auto_multi_buffer_buffer="no-limit",
             hfusion_enable_multiple_consumer_fusion=True,
-            enable_dynamic_cv_flow_opt=True,
             intra_cache_num=3,
             inter_cache_num=2,
         )
@@ -615,6 +662,10 @@ def paged_attention_prefill_impl(
             value_cache,
             o,
             aux_mask,
+            task_b,
+            task_q_block,
+            task_q_head,
+            core_task_offsets,
             batch_size,
             cu_q_lens,
             seqlens_kv,
@@ -638,8 +689,6 @@ def paged_attention_prefill_impl(
             aux_mask.stride(0),
             aux_mask.stride(1),
             softmax_scale,
-            core_task,
-            core_range_tensor,
             aux_mask.shape[0],
             page_size,
             num_q_heads,
