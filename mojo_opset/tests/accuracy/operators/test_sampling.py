@@ -39,8 +39,6 @@ def test_topp_sampling(shape, topk, topp, min_tokens_to_keep):
     top_p_sampling_ref = MojoTopPSampling._registry.get("torch")(
         top_p=topp, min_tokens_to_keep=min_tokens_to_keep, rand_top_k=topk
     )
-    perf(lambda: top_p_sampling(logits))
-    perf(lambda: top_p_sampling_ref(logits))
     # 两个实现采用不同采样策略（torch.multinomial 逆CDF vs 类Gumbel-max），
     # 单次采样的 token 不可逐个比对。改为对同一 logits 大量重复采样，
     # 比较返回概率 out_probs 的统计均值和标准差：
