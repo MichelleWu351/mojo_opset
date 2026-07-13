@@ -97,15 +97,23 @@ def test_residual_add_layernorm(x, residual, weight, bias, norm_pos, eps):
 @auto_switch_platform(set_perf=True)
 @bypass_not_implemented
 def test_rmsnorm(x, weight, eps):
-    rmsnorm = MojoRMSNorm(
+    rmsnorm = MojoRMSNorm._registry.get("ttx")(
         weight.size(0),
         eps,
     ).to(x.device)
-
+    rmsnorm_ref = (
+        MojoRMSNorm._registry.get("torch_npu")(
+            eps=eps,
+            norm_size=weight.size(0),
+        )
+        .to(x.device)
+        .to(weight.dtype)
+    )
     with torch.no_grad():
         rmsnorm.weight.copy_(weight.to(torch.float32))
 
     perf(lambda: rmsnorm(x))  # noqa: F821
+    perf(lambda: rmsnorm_ref(x))  # noqa: F821
 
 @pytest.mark.parametrize(
     "x, weight, group_dims",
@@ -176,7 +184,11 @@ def test_grouprmsnorm(x, weight, group_dims, eps):
 @auto_switch_platform(set_perf=True)
 @bypass_not_implemented
 def test_layernorm(x, weight, bias, eps):
-    layernorm = MojoLayerNorm(
+    layernorm = MojoLayerNorm._registry.get("ttx")(
+        norm_size=weight.size(0),
+        eps=eps,
+    ).to(x.device)
+    layernorm_ref = MojoLayerNorm._registry.get("torch")(
         norm_size=weight.size(0),
         eps=eps,
     ).to(x.device)
@@ -186,3 +198,4 @@ def test_layernorm(x, weight, bias, eps):
         layernorm.bias.copy_(bias.to(torch.float32))
 
     perf(lambda: layernorm(x))  # noqa: F821
+    perf(lambda: layernorm_ref(x))  # noqa: F821

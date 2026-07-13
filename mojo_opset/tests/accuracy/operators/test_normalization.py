@@ -35,14 +35,15 @@ dtypes = [torch.float16, torch.bfloat16]
 )
 @pytest.mark.parametrize("dtype", dtypes)
 @pytest.mark.parametrize("eps", [1e-5])
+@auto_switch_platform(set_perf=True)
 @bypass_not_implemented
 def test_rmsnorm(shape, dtype, eps):
     x = torch.randn(size=shape, dtype=dtype)
     weight = torch.randn(size=(shape[-1],), dtype=dtype)
-    rmsnorm = MojoRMSNorm(eps=eps, norm_size=shape[-1], device=x.device, dtype=x.dtype)
+    rmsnorm = MojoRMSNorm._registry.get("ttx")(eps=eps, norm_size=shape[-1], device=x.device, dtype=x.dtype)
 
     rmsnorm_ref = (
-        MojoRMSNorm._registry.get("torch")(
+        MojoRMSNorm._registry.get("torch_npu")(
             eps=eps,
             norm_size=weight.size(0),
         )
@@ -59,6 +60,8 @@ def test_rmsnorm(shape, dtype, eps):
     else:
         atol, rtol = 3e-2, 6e-3
     rmsnorm.forward_diff_with(rmsnorm_ref, x, atol=atol, rtol=rtol)
+    perf(lambda: rmsnorm(x))  # noqa: F821
+    perf(lambda: rmsnorm_ref(x))  # noqa: F821
 
 
 @pytest.mark.parametrize(
@@ -73,12 +76,13 @@ def test_rmsnorm(shape, dtype, eps):
 )
 @pytest.mark.parametrize("dtype", dtypes)
 @pytest.mark.parametrize("eps", [1e-5])
+@auto_switch_platform(set_perf=True)
 @bypass_not_implemented
 def test_layernorm(shape, dtype, eps):
     x = torch.randn(size=shape, dtype=dtype)
     weight = torch.randn(size=(shape[-1],), dtype=dtype)
     bias = torch.randn(size=(shape[-1],), dtype=dtype)
-    layernorm = MojoLayerNorm(eps=eps, norm_size=weight.size(0), dtype=weight.dtype, device=x.device)
+    layernorm = MojoLayerNorm._registry.get("ttx")(eps=eps, norm_size=weight.size(0), dtype=weight.dtype, device=x.device)
 
     layernorm_ref = (
         MojoLayerNorm._registry.get("torch")(
@@ -100,7 +104,8 @@ def test_layernorm(shape, dtype, eps):
     else:
         atol, rtol = 5e-2, 1e-2
     layernorm.forward_diff_with(layernorm_ref, x, atol=atol, rtol=rtol)
-
+    perf(lambda: layernorm(x))
+    perf(lambda: layernorm_ref(x))
 
 @pytest.mark.parametrize(
     "bsz,group_dims,hidden_size",
@@ -216,7 +221,7 @@ def test_residual_add_rms_norm(shape, dtype, norm_pos, eps):
     add_norm = MojoResidualAddRMSNorm._registry.get("ttx")(
         norm_size=weight.size(0), eps=eps, norm_pos=norm_pos, device=x.device, dtype=weight.dtype
     )
-    add_norm_ref = MojoResidualAddRMSNorm._registry.get("torch")(
+    add_norm_ref = MojoResidualAddRMSNorm._registry.get("torch_npu")(
         norm_size=weight.size(0),
         eps=eps,
         norm_pos=norm_pos,

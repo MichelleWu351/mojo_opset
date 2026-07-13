@@ -309,56 +309,63 @@ def test_store_paged_kv_without_chunk_metadata(
         device=get_torch_device(),
     )
 
+    key_states = case["key_states"]
+    value_states = case["value_states"]
+    k_cache = case["k_cache"]
+    v_cache = case["v_cache"]
+    block_table = case["block_table"]
+    cu_q_lens = case["cu_q_lens"]
+    context_kv_lens = case["context_kv_lens"]
+
     store_paged_kv_ref = MojoStorePagedKVCache._registry.get("torch_npu")()
     store_paged_kv = MojoStorePagedKVCache._registry.get("ttx")()
     if type(store_paged_kv_ref) is type(store_paged_kv):
         raise NotImplementedError("both operands resolve to the same implementation, skipping comparison.")
 
     k_cache_ref, v_cache_ref = store_paged_kv_ref(
-        case["key_states"],
-        case["value_states"],
-        case["k_cache"].clone(),
-        case["v_cache"].clone(),
-        case["block_table"],
-        case["cu_q_lens"],
-        case["context_kv_lens"],
+        key_states,
+        value_states,
+        k_cache.clone(),
+        v_cache.clone(),
+        block_table,
+        cu_q_lens,
+        context_kv_lens,
         chunk_metadata=None,
     )
-    # perf(
-    #     lambda: store_paged_kv_ref(
-    #         case["key_states"],
-    #         case["value_states"],
-    #         case["k_cache"].clone(),
-    #         case["v_cache"].clone(),
-    #         case["block_table"],
-    #         case["cu_q_lens"],
-    #         case["context_kv_lens"],
-    #         chunk_metadata=None,
-    #     )
-    # )
-    k_cache, v_cache = store_paged_kv(
-        case["key_states"],
-        case["value_states"],
-        case["k_cache"].clone(),
-        case["v_cache"].clone(),
-        case["block_table"],
-        case["cu_q_lens"],
-        case["context_kv_lens"],
-
+    perf(
+        lambda: store_paged_kv_ref(
+            key_states,
+            value_states,
+            k_cache.clone(),
+            v_cache.clone(),
+            block_table,
+            cu_q_lens,
+            context_kv_lens,
+            chunk_metadata=None,
+        )
     )
-    # perf(  # noqa: F821
-    #     lambda: store_paged_kv(
-    #         case["key_states"],
-    #         case["value_states"],
-    #         case["k_cache"].clone(),
-    #         case["v_cache"].clone(),
-    #         case["block_table"],
-    #         case["cu_q_lens"],
-    #         case["context_kv_lens"],
-    #     )
-    # )
-    assert_close(k_cache, k_cache_ref)
-    assert_close(v_cache, v_cache_ref)
+    k_cache_new, v_cache_new = store_paged_kv(
+        key_states,
+        value_states,
+        k_cache.clone(),
+        v_cache.clone(),
+        block_table,
+        cu_q_lens,
+        context_kv_lens,
+    )
+    perf(  # noqa: F821
+        lambda: store_paged_kv(
+            key_states,
+            value_states,
+            k_cache.clone(),
+            v_cache.clone(),
+            block_table,
+            cu_q_lens,
+            context_kv_lens,
+        )
+    )
+    assert_close(k_cache_new, k_cache_ref)
+    assert_close(v_cache_new, v_cache_ref)
 
 
 @auto_switch_platform()

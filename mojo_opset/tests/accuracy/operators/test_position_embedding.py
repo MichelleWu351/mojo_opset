@@ -11,6 +11,7 @@ from mojo_opset.experimental import MojoRelativeEmbedding
 from mojo_opset.tests.utils import bypass_not_implemented
 from mojo_opset.utils.platform import get_torch_device
 from mojo_opset.tests.utils import auto_switch_platform
+from mojo_opset.tests.utils import assert_close
 torch.random.manual_seed(42)
 
 VISION_VIT_CONFIG = {
@@ -221,6 +222,10 @@ def test_apply_rope(bs, seqlen, q_heads, k_heads, head_first, head_dim, rope_per
 
     rope = MojoApplyRoPE._registry.get("ttx")()
     rope_ref = MojoApplyRoPE._registry.get("torch_npu")()
+    # dq, dk = rope(q, k, cos, sin, head_first)
+    # dq_ref, dk_ref = rope_ref(q, k, cos, sin, head_first)
+    # assert_close(dq, dq_ref)
+    # assert_close(dk, dk_ref)
     perf(lambda: rope(
         q,
         k,

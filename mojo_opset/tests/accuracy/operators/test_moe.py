@@ -12,7 +12,7 @@ from mojo_opset import MojoMoEGating
 from mojo_opset import MojoExperts
 from mojo_opset.utils.platform import get_torch_device
 from mojo_opset.tests.utils import bypass_not_implemented
-
+from mojo_opset.tests.utils import auto_switch_platform
 
 @pytest.mark.parametrize(
     "num_experts, top_k, hidden_size, intermediate_size, num_tokens",
@@ -24,6 +24,7 @@ from mojo_opset.tests.utils import bypass_not_implemented
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@auto_switch_platform(set_perf=True)
 @bypass_not_implemented
 def test_experts(num_experts, top_k, hidden_size, intermediate_size, num_tokens, dtype):
     device = get_torch_device()
@@ -36,13 +37,13 @@ def test_experts(num_experts, top_k, hidden_size, intermediate_size, num_tokens,
     total_tokens = int(token_count.sum().item())
     input_fp = torch.randn(total_tokens, hidden_size, dtype=dtype, device=device)
 
-    moe = MojoExperts(
+    moe = MojoExperts._registry.get("ttx")(
         num_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
 
-    moe_ref = MojoExperts._registry.get("torch")(
+    moe_ref = MojoExperts(
         num_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -55,7 +56,7 @@ def test_experts(num_experts, top_k, hidden_size, intermediate_size, num_tokens,
         nn.init.normal_(p, std=0.02)
 
     moe.load_state_dict(moe_ref.state_dict())
-
+    perf(lambda: moe(input_fp, token_count))
     moe.forward_diff_with(moe_ref, input_fp, token_count, mixed_tol=True)
 
 
@@ -69,19 +70,20 @@ def test_experts(num_experts, top_k, hidden_size, intermediate_size, num_tokens,
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@auto_switch_platform(set_perf=True)
 @bypass_not_implemented
 def test_moe(num_experts, top_k, hidden_size, intermediate_size, num_tokens, dtype):
     device = get_torch_device()
     torch.manual_seed(0)
 
-    moe = MojoMoE(
+    moe = MojoMoE._registry.get("ttx")(
         num_experts=num_experts,
         top_k=top_k,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
 
-    moe_ref = MojoMoE._registry.get("torch")(
+    moe_ref = MojoMoE(
         num_experts=num_experts,
         top_k=top_k,
         hidden_size=hidden_size,
@@ -100,6 +102,7 @@ def test_moe(num_experts, top_k, hidden_size, intermediate_size, num_tokens, dty
     moe.load_state_dict(moe_ref.state_dict())
 
     x = torch.rand(num_tokens, hidden_size, dtype=dtype, device=device)
+    perf(lambda: moe(x))
     moe.forward_diff_with(moe_ref, x, mixed_tol=True)
 
 
@@ -113,18 +116,19 @@ def test_moe(num_experts, top_k, hidden_size, intermediate_size, num_tokens, dty
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@auto_switch_platform(set_perf=True)
 @bypass_not_implemented
 def test_moe_gating(num_experts, top_k, hidden_size, num_tokens, dtype):
     device = get_torch_device()
     torch.manual_seed(0)
 
-    moe_gating = MojoMoEGating(
+    moe_gating = MojoMoEGating._registry.get("ttx")(
         hidden_size=hidden_size,
         num_experts=num_experts,
         top_k=top_k,
     )
 
-    moe_gating_ref = MojoMoEGating._registry.get("torch")(
+    moe_gating_ref = MojoMoEGating(
         hidden_size=hidden_size,
         num_experts=num_experts,
         top_k=top_k,
@@ -140,6 +144,7 @@ def test_moe_gating(num_experts, top_k, hidden_size, num_tokens, dtype):
     assert moe_gating.gate_weight.dtype == torch.float32 and moe_gating_ref.gate_weight.dtype == torch.float32
 
     x = torch.rand(num_tokens, hidden_size, dtype=dtype, device=device)
+    perf(lambda: moe_gating(x))
     moe_gating.forward_diff_with(
         moe_gating_ref, x,
         atol=(0, 1e-2),
@@ -158,12 +163,13 @@ def test_moe_gating(num_experts, top_k, hidden_size, num_tokens, dtype):
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@auto_switch_platform(set_perf=True)
 @bypass_not_implemented
 def test_moe_dispatch(num_experts, top_k, hidden_size, num_tokens, dtype):
     device = get_torch_device()
     torch.manual_seed(0)
 
-    moe_dispatch = MojoMoEDispatch(num_experts=num_experts)
+    moe_dispatch = MojoMoEDispatch._registry.get("ttx")(num_experts=num_experts)
     moe_dispatch_ref = MojoMoEDispatch._registry.get("torch")(num_experts=num_experts)
 
     moe_dispatch = moe_dispatch.to(device)
@@ -208,7 +214,8 @@ def test_moe_dispatch(num_experts, top_k, hidden_size, num_tokens, dtype):
         gate_pos = expert_match.to(torch.int64).argmax(dim=-1)
         expected_gates = top_k_gates[token_slice, gate_pos].unsqueeze(-1)
         torch.testing.assert_close(sorted_gates[start:end], expected_gates, atol=0, rtol=0)
-
+    perf(lambda: moe_dispatch(hidden_states, top_k_gates, top_k_indices,))
+    perf(lambda: moe_dispatch_ref(hidden_states, top_k_gates, top_k_indices,))
 
 @pytest.mark.parametrize(
     "num_experts, hidden_size, intermediate_size, tokens_per_expert",
@@ -219,17 +226,18 @@ def test_moe_dispatch(num_experts, top_k, hidden_size, num_tokens, dtype):
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@auto_switch_platform(set_perf=True)
 @bypass_not_implemented
 def test_moe_experts(num_experts, hidden_size, intermediate_size, tokens_per_expert, dtype):
     device = get_torch_device()
     torch.manual_seed(0)
 
-    moe_experts = MojoExperts(
+    moe_experts = MojoExperts._registry.get("ttx")(
         num_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
-    moe_experts_ref = MojoExperts._registry.get("torch")(
+    moe_experts_ref = MojoExperts(
         num_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -245,6 +253,7 @@ def test_moe_experts(num_experts, hidden_size, intermediate_size, tokens_per_exp
     token_count = torch.tensor(tokens_per_expert, dtype=torch.int32, device=device)
     sorted_hidden_states = torch.rand(int(token_count.sum().item()), hidden_size, dtype=dtype, device=device)
 
+    perf(lambda: moe_experts(sorted_hidden_states, token_count))
     moe_experts.forward_diff_with(
         moe_experts_ref,
         sorted_hidden_states,
@@ -263,13 +272,14 @@ def test_moe_experts(num_experts, hidden_size, intermediate_size, tokens_per_exp
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@auto_switch_platform(set_perf=True)
 @bypass_not_implemented
 def test_moe_combine(num_tokens, top_k, hidden_size, dtype):
     device = get_torch_device()
     torch.manual_seed(0)
 
-    moe_combine = MojoMoECombine(multiply_by_gates=True)
-    moe_combine_ref = MojoMoECombine._registry.get("torch")(multiply_by_gates=True)
+    moe_combine = MojoMoECombine._registry.get("ttx")(multiply_by_gates=True)
+    moe_combine_ref = MojoMoECombine(multiply_by_gates=True)
 
     moe_combine = moe_combine.to(device)
     moe_combine_ref = moe_combine_ref.to(device)
@@ -291,6 +301,7 @@ def test_moe_combine(num_tokens, top_k, hidden_size, dtype):
     sorted_gates = sorted_gates[perm].contiguous()
     token_indices = token_indices[perm].contiguous()
 
+    perf(lambda: moe_combine(output_buffer, expert_outputs, sorted_gates, token_indices))
     moe_combine.forward_diff_with(
         moe_combine_ref,
         output_buffer,

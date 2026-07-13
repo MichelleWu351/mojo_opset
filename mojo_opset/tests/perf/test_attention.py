@@ -431,7 +431,7 @@ def test_sdpa(
     blockwise_diffusion_attn_mask: torch.Tensor,
     enable_gqa: bool,
 ):
-    diffusion_attn = MojoSdpa(
+    diffusion_attn = MojoSdpa._registry.get("ttx")(
         scale=1.0 / math.sqrt(query.shape[-1]), enable_gqa=enable_gqa
     )
     diffusion_attn_ref = MojoSdpa._registry.get("torch")(

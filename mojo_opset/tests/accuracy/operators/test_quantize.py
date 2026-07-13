@@ -206,10 +206,9 @@ def test_dynamic_quant(shape, dtype):
         MojoDynamicQuant._registry.get("torch_npu")(input_size=shape[-1], quant_dtype=torch.int8),
         inv_smooth_scale=inv_smooth_scale,
     )
+    quant.forward_diff_with(quant_ref, x, atol=(1, 2e-3), rtol=(0, 2e-3))
     perf(lambda: quant(x))
     perf(lambda: quant_ref(x))
-    quant.forward_diff_with(quant_ref, x, atol=(1, 2e-3), rtol=(0, 2e-3))
-
 
 @pytest.mark.parametrize("tokens, hidden_size, token_count", moe_dynamic_quant_cases)
 @pytest.mark.parametrize("dtype", dtypes)
@@ -234,10 +233,9 @@ def test_moe_dynamic_quant(tokens, hidden_size, token_count, dtype):
         ),
         inv_smooth_scale=inv_smooth_scale,
     )
+    quant.forward_diff_with(quant_ref, x, token_count, atol=(1, 2e-3), rtol=(0, 2e-3))
     perf(lambda: quant(x, token_count))
     perf(lambda: quant_ref(x, token_count))
-    quant.forward_diff_with(quant_ref, x, token_count, atol=(1, 2e-3), rtol=(0, 2e-3))
-
 
 @pytest.mark.parametrize("tokens, hidden_size, token_count", dequant_swiglu_quant_cases)
 @bypass_not_implemented

@@ -35,6 +35,8 @@ def test_pos_emb(bs, seqlen, q_heads, k_heads, head_dim, dtype):
     q = torch.randn(bs, seqlen, q_heads, head_dim, device=device, dtype=dtype).transpose(1, 2)
     k = torch.randn(bs, seqlen, k_heads, head_dim, device=device, dtype=dtype).transpose(1, 2)
 
-    rope = MojoApplyRoPE()
-
+    rope = MojoApplyRoPE._registry.get("ttx")()
+    rope_ref = MojoApplyRoPE._registry.get("torch_npu")()
+    # rope.forward_diff_with(rope_ref, q, k, cos, sin, head_first=True)
     perf(lambda: rope(q, k, cos, sin, head_first=True))  # noqa: F821
+    perf(lambda: rope_ref(q, k, cos, sin, head_first=True))  # noqa: F821
