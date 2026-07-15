@@ -559,8 +559,8 @@ def rope_bwd_impl(
         nope_dim,
         rope_dim,
         half_rope_dim,
-        is_aligned,
-        True,
+        ALIGNED=is_aligned,
+        INVERSE=True,
     )
 
     if head_first:
