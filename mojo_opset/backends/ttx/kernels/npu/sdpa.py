@@ -171,6 +171,15 @@ def get_autotune_config():
 #     configs=get_autotune_config(),
 #     key=["BSZ", "Q_HEAD_NUM", "SEQ", "HEAD_DIM"],  # 加入 shape 相关的关键参数
 # )
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128}),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256}),
+    ],
+    key=["BSZ", "Q_HEAD_NUM", "SEQ", "HEAD_DIM"],
+)
 @triton.jit
 def _sdpa_infer_kernel(
     Q,
@@ -850,8 +859,6 @@ def sdpa_infer_impl(
         KV_HEAD_NUM=kv_head_num,
         SEQ=seq_length,
         HEAD_DIM=head_dim,
-        BLOCK_M=128,
-        BLOCK_N=256,
         enable_ubuf_saving=True,
         enable_hivm_auto_cv_balance=True,
         multibuffer=True,  # 控制开double_buffer
@@ -861,6 +868,11 @@ def sdpa_infer_impl(
         set_workspace_multibuffer=4,
         tile_mix_vector_loop=8,
         tile_mix_cube_loop=4,
+        enable_dynamic_cv_pipeline=True,
+        enable_cube_block_merge=True,
+        hfusion_enable_multiple_consumer_fusion=True,
+        intra_cache_num=3,
+        inter_cache_num=2,
         **extra_kern_args,
     )
     return o
@@ -933,6 +945,11 @@ def sdpa_fwd_impl(
         lse.stride(0),
         lse.stride(1),
         lse.stride(2),
+        enable_dynamic_cv_pipeline=True,
+        enable_cube_block_merge=True,
+        hfusion_enable_multiple_consumer_fusion=True,
+        intra_cache_num=3,
+        inter_cache_num=2,
     )
 
     return o, lse

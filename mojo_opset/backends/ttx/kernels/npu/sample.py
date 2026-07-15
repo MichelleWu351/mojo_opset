@@ -483,6 +483,53 @@ def _topk_merge_kernel(
         tl.store(y_index_ptr + out_row_start + off_col, sorted_index)
 
 
+@libentry()
+@triton.jit
+def _top_k_sample_kernel(
+        sorted_logits_ptr,
+        sorted_indices_ptr,
+        rand_data_ptr,
+        output_ptr,
+        stride_logits_b,
+        stride_logits_k,
+        stride_indices_b,
+        stride_indices_k,
+        stride_rand_b,
+        stride_out0_b,
+        stride_out0_k,
+        TOP_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    row_logits_ptr = sorted_logits_ptr + pid * stride_logits_b
+    offsets = tl.arange(0, TOP_K)
+
+    logits = tl.load(row_logits_ptr + offsets * stride_logits_k)
+
+    logits_max = tl.max(logits, 0)
+    numerator = tl.exp(logits - logits_max)
+    probs = numerator / tl.sum(numerator, 0)
+
+    row_indices_ptr = sorted_indices_ptr + pid * stride_indices_b
+    out_token_ptr = output_ptr + pid * stride_out0_b
+    out_prob_ptr = out_token_ptr + 1
+
+    threshold = tl.load(rand_data_ptr + pid * stride_rand_b)
+    cum_probs = tl.cumsum(probs, 0)
+    is_candidate = cum_probs >= threshold
+    candidate_indices = tl.where(is_candidate, offsets, TOP_K)
+    sampled_index_in_topk = tl.min(candidate_indices, 0)
+    sampled_index_in_topk = tl.where(sampled_index_in_topk == TOP_K, 0, sampled_index_in_topk)
+
+    is_selected_mask = offsets == sampled_index_in_topk
+    selected_prob_val = tl.sum(tl.where(is_selected_mask, probs, 0.0), 0)
+    all_topk_indices = tl.load(row_indices_ptr + offsets * stride_indices_k)
+    selected_token_val = tl.sum(tl.where(is_selected_mask, all_topk_indices, 0), 0)
+
+    tl.store(out_token_ptr, selected_token_val.to(tl.int32))
+    tl.store(out_prob_ptr, selected_prob_val)
+
+
 def top_k_sampling_impl(
     logits: torch.FloatTensor,
     top_k: int = 50,
@@ -500,110 +547,32 @@ def top_k_sampling_impl(
     
     top_k = min(top_k, vocab_size)
     top_k = max(top_k, min_tokens_to_keep)
-    
-    descending = 1 if largest else 0
 
-    chunk_size = 32
-    if chunk_size < top_k:
-        chunk_size = triton.next_power_of_2(top_k)
-    chunk_num = triton.cdiv(vocab_size, chunk_size)
+    sorted_logits, sorted_topk_indices = torch.topk(logits_2d, top_k, largest=largest)
 
-    stage1_elem_cnt = chunk_num * top_k
-    row_stride = stage1_elem_cnt
-    stage1_sorted_row_stride = chunk_num * chunk_size
-    
-    pad_val = filter_value if descending else -filter_value
+    rand_data = torch.rand(batch_size, device=device)
+    output_data = torch.empty((batch_size, 2), dtype=torch.float32, device=device)
 
-    stage1_sorted = torch.full((batch_size, stage1_sorted_row_stride), pad_val, device=device, dtype=logits.dtype).contiguous()
-    stage1_sorted_index = torch.zeros((batch_size, stage1_sorted_row_stride), device=device, dtype=torch.int32).contiguous()
-    num_vectorcore = triton.runtime.driver.active.utils.get_device_properties(device)["num_vectorcore"]
-    stage1_total_tasks = batch_size * chunk_num
-    _topk_stage1_kernel[(num_vectorcore,)](
-        stage1_sorted,
-        stage1_sorted_index,
-        logits_2d,
-        filter_value,
-        top_k,
-        stage1_total_tasks,
-        vocab_size,
-        chunk_num,
-        chunk_size,
-        stage1_sorted_row_stride,
-        descending,
-        num_vectorcore,
+    grid = (batch_size,)
+    _top_k_sample_kernel[grid](
+        sorted_logits,
+        sorted_topk_indices,
+        rand_data,
+        output_data,
+        sorted_logits.stride(0),
+        sorted_logits.stride(1),
+        sorted_topk_indices.stride(0),
+        sorted_topk_indices.stride(1),
+        rand_data.stride(0),
+        output_data.stride(0),
+        output_data.stride(1),
+        TOP_K=top_k,
     )
 
-    stage1_out, stage1_out_index = _compact_sorted_blocks(
-        stage1_sorted,
-        stage1_sorted_index,
-        batch_size,
-        chunk_num,
-        chunk_size,
-        top_k,
-    )
-    
-    candidate_vals = stage1_out
-    candidate_idx = stage1_out_index
-    current_groups = chunk_num
-    current_row_stride = row_stride
+    output_tokens = output_data[:, 0].long().unsqueeze(-1)
+    output_probs = output_data[:, 1].unsqueeze(-1)
 
-    max_merge_candidates = 32
-    merge_group_chunks = max(1, max_merge_candidates // top_k)
-    while merge_group_chunks > 1 and (merge_group_chunks * top_k) > max_merge_candidates:
-        merge_group_chunks //= 2
-    if merge_group_chunks < 2:
-        merge_group_chunks = 2
-
-    while current_groups > 1:
-        group_chunks = min(merge_group_chunks, current_groups)
-        next_groups = triton.cdiv(current_groups, group_chunks)
-        next_row_stride = next_groups * top_k
-        block_size = triton.next_power_of_2(group_chunks * top_k)
-        next_sorted_row_stride = next_groups * block_size
-
-        next_sorted_vals = torch.full((batch_size, next_sorted_row_stride), pad_val, device=device, dtype=logits.dtype).contiguous()
-        next_sorted_idx = torch.zeros((batch_size, next_sorted_row_stride), device=device, dtype=torch.int32).contiguous()
-        merge_total_tasks = batch_size * next_groups
-        _topk_merge_kernel[(num_vectorcore,)](
-            next_sorted_vals,
-            next_sorted_idx,
-            candidate_vals,
-            candidate_idx,
-            filter_value,
-            top_k,
-            current_groups * top_k,
-            current_row_stride,
-            next_sorted_row_stride,
-            next_groups,
-            group_chunks,
-            block_size,
-            descending,
-            merge_total_tasks,
-            num_vectorcore,
-        )
-
-        next_vals, next_idx = _compact_sorted_blocks(
-            next_sorted_vals,
-            next_sorted_idx,
-            batch_size,
-            next_groups,
-            block_size,
-            top_k,
-        )
-
-        candidate_vals = next_vals
-        candidate_idx = next_idx
-        current_groups = next_groups
-        current_row_stride = next_row_stride
-
-    final_candidate_vals = candidate_vals[:, :top_k].contiguous()
-    final_candidate_idx = candidate_idx[:, :top_k].contiguous()
-    final_probs_dist = torch.nn.functional.softmax(final_candidate_vals, dim=-1)
-    select_index = torch.multinomial(final_probs_dist, num_samples=1)
-    stage2_out_prob = torch.gather(final_probs_dist, dim=-1, index=select_index)
-    stage2_out_token = torch.gather(final_candidate_idx, dim=-1, index=select_index)
-    
-    return stage2_out_prob, stage2_out_token
+    return output_probs, output_tokens
 
 
 @triton.jit

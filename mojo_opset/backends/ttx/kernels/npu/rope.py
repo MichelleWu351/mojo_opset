@@ -190,16 +190,17 @@ def _rot_pos_embed_kernel(
         triton.Config({"TOKEN_BLOCK_SIZE": 32}),
     ],
     key=["n_qh", "n_kh", "half_rope_dim"],
-    restore_value=["q_ptr", "k_ptr"],
 )
 @triton.jit(do_not_specialize=["seq_len"])
-def _rope_inplace_kernel(
+def _rope_kernel(
     q_ptr,
     q_batch_stride,
     q_seq_stride,
     k_ptr,
     k_batch_stride,
     k_seq_stride,
+    q_out_ptr,
+    k_out_ptr,
     cos_ptr,
     cos_batch_stride,
     cos_seq_stride,
@@ -207,7 +208,6 @@ def _rope_inplace_kernel(
     sin_batch_stride,
     sin_seq_stride,
     seq_len,
-    # num_seq_blocks,
     bs,
     n_qh: tl.constexpr,
     n_kh: tl.constexpr,
@@ -258,6 +258,34 @@ def _rope_inplace_kernel(
         cos_tile = tl.reshape(cos_block_2d, (TOKEN_BLOCK_SIZE, 1, half_rope_dim), can_reorder=True)
         sin_tile = tl.reshape(sin_block_2d, (TOKEN_BLOCK_SIZE, 1, half_rope_dim), can_reorder=True)
 
+        # Copy the nope_dim (non-rotary) part from input to output.
+        # In the non-inplace design, q_out is freshly allocated (empty_like),
+        # so we must explicitly copy the nope_dim region. When nope_dim == 0
+        # (rope_dim == head_dim), this block is eliminated at compile time.
+        if nope_dim > 0:
+            nope_dim_offsets = tl.arange(0, nope_dim)
+            nope_dim_mask = nope_dim_offsets < nope_dim
+
+            q_nope_offsets = (
+                batch_idx * q_batch_stride
+                + global_seq_offsets[:, None, None] * q_seq_stride
+                + head_q_offsets[None, :, None] * head_dim
+                + nope_dim_offsets[None, None, :]
+            )
+            q_nope_mask = seq_mask[:, None, None] & (head_q_offsets[None, :, None] < n_qh) & nope_dim_mask[None, None, :]
+            q_nope_tile = tl.load(q_ptr + q_nope_offsets, mask=q_nope_mask, other=0.0)
+            tl.store(q_out_ptr + q_nope_offsets, q_nope_tile, mask=q_nope_mask)
+
+            k_nope_offsets = (
+                batch_idx * k_batch_stride
+                + global_seq_offsets[:, None, None] * k_seq_stride
+                + head_k_offsets[None, :, None] * head_dim
+                + nope_dim_offsets[None, None, :]
+            )
+            k_nope_mask = seq_mask[:, None, None] & (head_k_offsets[None, :, None] < n_kh) & nope_dim_mask[None, None, :]
+            k_nope_tile = tl.load(k_ptr + k_nope_offsets, mask=k_nope_mask, other=0.0)
+            tl.store(k_out_ptr + k_nope_offsets, k_nope_tile, mask=k_nope_mask)
+
         if ALIGNED:
             rope_dim_offsets = tl.arange(0, rope_dim)
             rope_dim_mask = rope_dim_offsets < rope_dim
@@ -273,7 +301,7 @@ def _rope_inplace_kernel(
 
             q_tile = tl.load(q_ptr + q_offsets, mask=q_mask, other=0.0).to(sin_block_2d.dtype)
             q_tile = _compute_rope(q_tile, sin_tile, cos_tile, n_qh, half_rope_dim, TOKEN_BLOCK_SIZE, INVERSE)
-            tl.store(q_ptr + q_offsets, q_tile, mask=q_mask)
+            tl.store(q_out_ptr + q_offsets, q_tile, mask=q_mask)
 
             k_offsets = (
                 batch_idx * k_batch_stride
@@ -286,7 +314,7 @@ def _rope_inplace_kernel(
 
             k_tile = tl.load(k_ptr + k_offsets, mask=k_mask, other=0).to(sin_block_2d.dtype)
             k_tile = _compute_rope(k_tile, sin_tile, cos_tile, n_kh, half_rope_dim, TOKEN_BLOCK_SIZE, INVERSE)
-            tl.store(k_ptr + k_offsets, k_tile, mask=k_mask)
+            tl.store(k_out_ptr + k_offsets, k_tile, mask=k_mask)
         else:
             q_offsets_half1 = (
                 batch_idx * q_batch_stride
@@ -295,14 +323,7 @@ def _rope_inplace_kernel(
                 + nope_dim
                 + half_rope_dim_offsets[None, None, :]
             )
-            q_offsets_half2 = (
-                batch_idx * q_batch_stride
-                + global_seq_offsets[:, None, None] * q_seq_stride
-                + head_q_offsets[None, :, None] * head_dim
-                + nope_dim
-                + half_rope_dim
-                + half_rope_dim_offsets[None, None, :]
-            )
+            q_offsets_half2 = q_offsets_half1 + half_rope_dim
             q_half_mask = (
                 seq_mask[:, None, None] & (head_q_offsets[None, :, None] < n_qh) & half_rope_dim_mask[None, None, :]
             )
@@ -310,8 +331,8 @@ def _rope_inplace_kernel(
             q_tile_1 = tl.load(q_ptr + q_offsets_half1, mask=q_half_mask, other=0.0).to(sin_block_2d.dtype)
             q_tile_2 = tl.load(q_ptr + q_offsets_half2, mask=q_half_mask, other=0.0).to(sin_block_2d.dtype)
             new_q_1, new_q_2 = _compute_rope_separated(q_tile_1, q_tile_2, sin_tile, cos_tile, INVERSE)
-            tl.store(q_ptr + q_offsets_half1, new_q_1, mask=q_half_mask)
-            tl.store(q_ptr + q_offsets_half2, new_q_2, mask=q_half_mask)
+            tl.store(q_out_ptr + q_offsets_half1, new_q_1, mask=q_half_mask)
+            tl.store(q_out_ptr + q_offsets_half2, new_q_2, mask=q_half_mask)
 
             k_offsets_half1 = (
                 batch_idx * k_batch_stride
@@ -320,14 +341,7 @@ def _rope_inplace_kernel(
                 + nope_dim
                 + half_rope_dim_offsets[None, None, :]
             )
-            k_offsets_half2 = (
-                batch_idx * k_batch_stride
-                + global_seq_offsets[:, None, None] * k_seq_stride
-                + head_k_offsets[None, :, None] * head_dim
-                + nope_dim
-                + half_rope_dim
-                + half_rope_dim_offsets[None, None, :]
-            )
+            k_offsets_half2 = k_offsets_half1 + half_rope_dim
             k_half_mask = (
                 seq_mask[:, None, None] & (head_k_offsets[None, :, None] < n_kh) & half_rope_dim_mask[None, None, :]
             )
@@ -335,51 +349,115 @@ def _rope_inplace_kernel(
             k_tile_1 = tl.load(k_ptr + k_offsets_half1, mask=k_half_mask, other=0.0).to(sin_block_2d.dtype)
             k_tile_2 = tl.load(k_ptr + k_offsets_half2, mask=k_half_mask, other=0.0).to(sin_block_2d.dtype)
             new_k_1, new_k_2 = _compute_rope_separated(k_tile_1, k_tile_2, sin_tile, cos_tile, INVERSE)
-            tl.store(k_ptr + k_offsets_half1, new_k_1, mask=k_half_mask)
-            tl.store(k_ptr + k_offsets_half2, new_k_2, mask=k_half_mask)
+            tl.store(k_out_ptr + k_offsets_half1, new_k_1, mask=k_half_mask)
+            tl.store(k_out_ptr + k_offsets_half2, new_k_2, mask=k_half_mask)
 
 
-def _normalize_to_bsnd(
+def _normalize_for_rope(
+    x: torch.Tensor,
+    head_first: bool,
+) -> Tuple[torch.Tensor, int, int, bool, int, int, int, int]:
+    """Normalize a tensor for the RoPE kernel.
+
+    The kernel hardcodes head_dim as the head stride, so it requires the physical
+    layout to be [B,S,N,D] (head stride == head_dim). This function detects whether
+    the input already has this layout (optimized path, no transpose needed) or
+    falls back to transpose+contiguous.
+
+    Returns: (x, batch_stride, seq_stride, need_transpose_back, batch_size, seq_len, n_head, head_dim)
+    """
+    need_transpose_back = False
+
+    if x.dim() == 4:
+        batch_size = x.shape[0]
+        if head_first:
+            # Logical [B, N, S, D]
+            n_head, seq_len, head_dim = x.shape[1], x.shape[2], x.shape[3]
+            if x.stride(1) == head_dim:
+                # Physical [B,S,N,D] (e.g. after transpose): head stride == head_dim
+                batch_stride, seq_stride = x.stride(0), x.stride(2)
+            else:
+                # Physical [B,N,S,D] contiguous: need transpose to [B,S,N,D]
+                need_transpose_back = True
+                x = x.transpose(1, 2).contiguous()
+                batch_stride, seq_stride = x.stride(0), x.stride(1)
+        else:
+            # [B, S, N, D]: already in the correct layout
+            seq_len, n_head, head_dim = x.shape[1], x.shape[2], x.shape[3]
+            batch_stride, seq_stride = x.stride(0), x.stride(1)
+    else:
+        assert x.dim() == 3
+        batch_size = 1
+        if head_first:
+            # Logical [N, T, D]
+            n_head, seq_len, head_dim = x.shape[0], x.shape[1], x.shape[2]
+            if x.stride(0) == head_dim:
+                # Physical [T,N,D] (e.g. after transpose): head stride == head_dim
+                batch_stride, seq_stride = 0, x.stride(1)
+            else:
+                # Physical [N,T,D] contiguous: need transpose to [T,N,D]
+                need_transpose_back = True
+                x = x.transpose(0, 1).contiguous()
+                batch_stride, seq_stride = 0, x.stride(0)
+        else:
+            # [T, N, D]: already in the correct layout
+            seq_len, n_head, head_dim = x.shape[0], x.shape[1], x.shape[2]
+            batch_stride, seq_stride = 0, x.stride(0)
+
+    return x, batch_stride, seq_stride, need_transpose_back, batch_size, seq_len, n_head, head_dim
+
+
+def _run_rope_kernel(
     q: torch.Tensor,
     k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
     head_first: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, int, int, int, int, int, int, int, int, int]:
-    """Normalize q/k to [B, S, N, D] layout, returning strides and metadata."""
+    inverse: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Shared kernel launch logic for forward and backward RoPE.
 
-    if q.dim() == 3:
-        assert k.dim() == 3
-        if head_first:
-            # [N, T, D] -> [BS, N, D]
-            seq_len = q.shape[0]
-            q = q.transpose(0, 1).clone(memory_format=torch.contiguous_format)
-            k = k.transpose(0, 1).clone(memory_format=torch.contiguous_format)
-        else:
-            q = q.clone(memory_format=torch.contiguous_format)
-            k = k.clone(memory_format=torch.contiguous_format)
-        batch_size = 1
-        seq_len, n_q_head, head_dim = q.shape
-        n_kv_head = k.shape[1]
-        q_batch_stride, q_seq_stride = 0, q.stride(0)
-        k_batch_stride, k_seq_stride = 0, k.stride(0)
-    else:
-        assert q.dim() == 4 and k.dim() == 4
-        if head_first:
-            q = q.transpose(1, 2).clone(memory_format=torch.contiguous_format)
-            k = k.transpose(1, 2).clone(memory_format=torch.contiguous_format)
-        else:
-            q = q.clone(memory_format=torch.contiguous_format)
-            k = k.clone(memory_format=torch.contiguous_format)
+    Allocates output buffers via empty_like (alloc only, no data copy) and launches
+    the non-inplace kernel. If the input required transpose, transposes the output back.
+    """
+    q, q_bs, q_ss, need_tb, batch_size, seq_len, n_qh, head_dim = _normalize_for_rope(q, head_first)
+    k, k_bs, k_ss, _, _, _, n_kh, _ = _normalize_for_rope(k, head_first)
 
-        batch_size, seq_len, n_q_head, head_dim = q.shape
-        n_kv_head = k.shape[2]
-        q_batch_stride, q_seq_stride = q.stride(0), q.stride(1)
-        k_batch_stride, k_seq_stride = k.stride(0), k.stride(1)
-        
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
 
-    return (
-        q, k, batch_size, seq_len, n_q_head, n_kv_head, head_dim,
-        q_batch_stride, q_seq_stride, k_batch_stride, k_seq_stride,
+    rope_dim = cos.shape[-1]
+    nope_dim = head_dim - rope_dim
+    half_rope_dim = rope_dim // 2
+
+    if not cos.is_contiguous():
+        cos = cos.contiguous()
+    if not sin.is_contiguous():
+        sin = sin.contiguous()
+    cos_batch_stride = cos.stride(0) if (cos.dim() == 3 and cos.shape[0] > 1) else 0
+    sin_batch_stride = sin.stride(0) if (sin.dim() == 3 and sin.shape[0] > 1) else 0
+
+    grid = (get_num_cores(),)
+    _rope_kernel[grid](
+        q, q_bs, q_ss,
+        k, k_bs, k_ss,
+        q_out, k_out,
+        cos, cos_batch_stride, cos.stride(-2),
+        sin, sin_batch_stride, sin.stride(-2),
+        seq_len, batch_size,
+        n_qh, n_kh, head_dim, nope_dim, rope_dim, half_rope_dim,
+        ALIGNED=True, INVERSE=inverse,
     )
+
+    if need_tb:
+        if q_out.dim() == 4:
+            q_out = q_out.transpose(1, 2).contiguous()
+            k_out = k_out.transpose(1, 2).contiguous()
+        else:
+            q_out = q_out.transpose(0, 1).contiguous()
+            k_out = k_out.transpose(0, 1).contiguous()
+
+    return q_out, k_out
 
 
 def rot_pos_embed_impl(
@@ -440,72 +518,14 @@ def rope_fwd_impl(
     sin: torch.Tensor,
     head_first: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply RoPE to q/k with pre-extracted cos/sin.
+    """Apply RoPE to q/k with pre-extracted cos/sin (forward pass).
 
-    Supports:
-    - 4D padded prefill: q [B, S, N, D] or [B, N, S, D], cos [S, rope_dim]
-    - 3D varlen:  q [T, N, D] or [N, T, D], cos [T, rope_dim]
-    - 3D decode:  q [B, N, D] or [N, B, D], cos [B, rope_dim]
+    Supports 4D [B,S,N,D]/[B,N,S,D] and 3D [T,N,D]/[N,T,D] inputs.
+    Uses a non-inplace kernel with empty_like output allocation to avoid clone overhead.
     """
     cos = cos.to(q.dtype)
     sin = sin.to(q.dtype)
-
-    orig_q_shape = q.shape
-    orig_k_shape = k.shape
-    (
-        q, k, batch_size, seq_len, n_q_head, n_kv_head, head_dim,
-        q_batch_stride, q_seq_stride, k_batch_stride, k_seq_stride,
-    ) = _normalize_to_bsnd(q, k, head_first)
-
-    rope_dim = cos.shape[-1]
-    nope_dim = head_dim - rope_dim
-    half_rope_dim = rope_dim // 2
-
-    is_aligned = _is_half_rope_dim_aligned(half_rope_dim)
-
-    num_programs = get_num_cores()
-    grid = (num_programs,)
-
-    cos = cos.contiguous()
-    sin = sin.contiguous()
-    if cos.dim() == 3 and cos.shape[0] > 1:
-        cos_batch_stride = cos.stride(0)
-        sin_batch_stride = sin.stride(0)
-    else:
-        cos_batch_stride = 0
-        sin_batch_stride = 0
-
-    _rope_inplace_kernel[grid](
-        q,
-        q_batch_stride,
-        q_seq_stride,
-        k,
-        k_batch_stride,
-        k_seq_stride,
-        cos,
-        cos_batch_stride,
-        cos.stride(-2),
-        sin,
-        sin_batch_stride,
-        sin.stride(-2),
-        seq_len,
-        batch_size,
-        n_q_head,
-        n_kv_head,
-        head_dim,
-        nope_dim,
-        rope_dim,
-        half_rope_dim,
-        ALIGNED=is_aligned,
-        INVERSE=False,
-    )
-
-    if head_first:
-        q = q.transpose(-2, -3).contiguous()
-        k = k.transpose(-2, -3).contiguous()
-    q = q.reshape(*orig_q_shape)
-    k = k.reshape(*orig_k_shape)
-    return q, k
+    return _run_rope_kernel(q, k, cos, sin, head_first, inverse=False)
 
 
 def rope_bwd_impl(
@@ -515,60 +535,8 @@ def rope_bwd_impl(
     sin: torch.Tensor,
     head_first: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Backward pass of RoPE with pre-extracted cos/sin."""
-    orig_q_shape = dq.shape
-    orig_k_shape = dk.shape
-    (
-        dq, dk, batch_size, seq_len, n_q_head, n_kv_head, head_dim,
-        dq_batch_stride, dq_seq_stride, dk_batch_stride, dk_seq_stride,
-    ) = _normalize_to_bsnd(dq, dk, head_first)
+    """Apply inverse RoPE to dq/dk (backward pass).
 
-    rope_dim = cos.shape[-1]
-    nope_dim = head_dim - rope_dim
-    half_rope_dim = rope_dim // 2
-
-    is_aligned = _is_half_rope_dim_aligned(half_rope_dim)
-
-    num_programs = get_num_cores()
-    grid = (num_programs,)
-
-    cos = cos.contiguous()
-    sin = sin.contiguous()
-    if cos.dim() == 3:
-        cos_batch_stride = cos.stride(0)
-        sin_batch_stride = sin.stride(0)
-    else:
-        cos_batch_stride = 0
-        sin_batch_stride = 0
-
-    _rope_inplace_kernel[grid](
-        dq,
-        dq_batch_stride,
-        dq_seq_stride,
-        dk,
-        dk_batch_stride,
-        dk_seq_stride,
-        cos,
-        cos_batch_stride,
-        cos.stride(-2),
-        sin,
-        sin_batch_stride,
-        sin.stride(-2),
-        seq_len,
-        batch_size,
-        n_q_head,
-        n_kv_head,
-        head_dim,
-        nope_dim,
-        rope_dim,
-        half_rope_dim,
-        ALIGNED=is_aligned,
-        INVERSE=True,
-    )
-
-    if head_first:
-        dq = dq.transpose(-2, -3).contiguous()
-        dk = dk.transpose(-2, -3).contiguous()
-    dq = dq.reshape(*orig_q_shape)
-    dk = dk.reshape(*orig_k_shape)
-    return dq, dk
+    Uses a non-inplace kernel with empty_like output allocation to avoid clone overhead.
+    """
+    return _run_rope_kernel(dq, dk, cos, sin, head_first, inverse=True)
