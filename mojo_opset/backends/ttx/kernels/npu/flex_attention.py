@@ -1035,6 +1035,8 @@ def flex_attention_fwd_impl(
         intra_cache_num=3,
         inter_cache_num=2,
         enable_cross_if_fusion=True,
+        enable_buffer_insert_optimization=True,
+        enable_ub_refine_opt = True,
     )
 
     return output, lse
