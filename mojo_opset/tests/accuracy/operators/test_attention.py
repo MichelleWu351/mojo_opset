@@ -554,6 +554,18 @@ def test_paged_prefill_gqa_bucket_padded_varlen(gqa_layout: str):
         is_causal=True,
         gqa_layout=gqa_layout,
     )
+    if get_platform() == "npu":
+        num_q_heads = query.shape[1]
+        num_kv_heads = key_cache.shape[1]
+        page_size = key_cache.shape[2]
+        paged_prefill_attn.prepare_metadata(
+            cu_q_lens,
+            cu_total_seq_lens,
+            num_q_heads,
+            num_kv_heads,
+            page_size,
+        )
+
     paged_prefill_attn_ref = MojoPagedPrefillGQA._registry.get("torch")(
         is_causal=True,
         gqa_layout=gqa_layout,
