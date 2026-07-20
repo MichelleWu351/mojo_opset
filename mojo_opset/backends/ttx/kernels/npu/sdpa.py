@@ -857,6 +857,11 @@ def sdpa_infer_impl(
         set_workspace_multibuffer=4,
         tile_mix_vector_loop=8,
         tile_mix_cube_loop=4,
+        enable_dynamic_cv_pipeline=True,
+        enable_cube_block_merge=True,
+        hfusion_enable_multiple_consumer_fusion=True,
+        intra_cache_num=3,
+        inter_cache_num=2,
         **extra_kern_args,
     )
     return o
@@ -929,6 +934,11 @@ def sdpa_fwd_impl(
         lse.stride(0),
         lse.stride(1),
         lse.stride(2),
+        enable_dynamic_cv_pipeline=True,
+        enable_cube_block_merge=True,
+        hfusion_enable_multiple_consumer_fusion=True,
+        intra_cache_num=3,
+        inter_cache_num=2,
     )
 
     return o, lse

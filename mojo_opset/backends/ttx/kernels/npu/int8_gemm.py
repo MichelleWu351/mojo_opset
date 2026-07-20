@@ -39,6 +39,13 @@ def _get_autotune_configs():
         # Small M tiles
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 256}, _vmix),
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 256}, _vmix),
+        # Very small M tiles — for M=1~32 (e.g. decode, single-token inference)
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 256}),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 256}, _vmix),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 512}),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 256, "BLOCK_K": 256}),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 256, "BLOCK_K": 256}, _vmix),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 256, "BLOCK_K": 512}),
     ]
 
 
