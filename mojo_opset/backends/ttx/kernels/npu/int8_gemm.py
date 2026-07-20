@@ -14,11 +14,11 @@ import triton.language as tl
 
 from mojo_opset.backends.ttx.kernels.npu.utils import get_num_cores
 
-# Padding alignment — must be divisible by every BLOCK size in the autotune configs.
-# BLOCK_M ∈ {64, 128}  → pad M to 128
+# Padding alignment — _PAD_M must be divisible by the minimum BLOCK_M.
+# BLOCK_M ∈ {32, 64, 128}  → pad M to 32 (GCD of all BLOCK_M values)
 # BLOCK_N ∈ {64, 128, 256}  → pad N to 256
 # BLOCK_K ∈ {256, 512}  → pad K to 512
-_PAD_M = 128
+_PAD_M = 32
 _PAD_N = 256
 _PAD_K = 512
 
@@ -49,7 +49,35 @@ def _get_autotune_configs():
     ]
 
 
-@triton.autotune(configs=_get_autotune_configs(), key=["M", "N", "K"])
+def _prune_oversized_tiles(configs, nargs, **kwargs):
+    """Filter out configs whose tiles exceed the padded M/N/K dimensions.
+
+    The kernel uses ``M // BLOCK_M`` (floor division) to compute the number
+    of M-tiles.  When ``BLOCK_M > M`` the quotient is zero, so no tiles are
+    processed and the output is silently filled with zeros.  The autotuner
+    cannot detect this — a config that skips all work is always “fastest”.
+
+    This prune function removes such dangerous configs before benchmarking
+    so only tiles that fit within the (already host-padded) problem size are
+    considered.
+    """
+    M = nargs["M"]
+    N = nargs["N"]
+    K = nargs["K"]
+    return [
+        cfg
+        for cfg in configs
+        if cfg.kwargs.get("BLOCK_M", 0) <= M
+           and cfg.kwargs.get("BLOCK_N", 0) <= N
+           and cfg.kwargs.get("BLOCK_K", 0) <= K
+    ]
+
+
+@triton.autotune(
+    configs=_get_autotune_configs(),
+    key=["M", "N", "K"],
+    prune_configs_by={"early_config_prune": _prune_oversized_tiles},
+)
 @triton.jit
 def _int8_gemm_dequant_kernel(
     a_ptr, bt_ptr, c_ptr,
@@ -115,19 +143,24 @@ def _pad_to(x, mult):
     return ((x + mult - 1) // mult) * mult
 
 
-def prepare_b_impl(b: torch.Tensor) -> torch.Tensor:
-    """Transpose B to (N, K) row-major and pad to block boundaries.
+def prepare_b_impl(b: torch.Tensor, transposed: bool = False) -> torch.Tensor:
+    """Prepare B to (N, K) row-major and pad to block boundaries.
 
     For inference: weight B is fixed, call once and reuse.
 
     Args:
-        b: (K, N) int8
+        b: (K, N) int8 when transposed=False, (N, K) int8 when transposed=True
+        transposed: if True, b is already (N, K) and only padding is applied.
 
     Returns:
         bt: (N_padded, K_padded) int8, contiguous
     """
-    K_orig, N_orig = b.shape
-    bt = b.T.contiguous()
+    if transposed:
+        N_orig, K_orig = b.shape
+        bt = b.contiguous()
+    else:
+        K_orig, N_orig = b.shape
+        bt = b.T.contiguous()
 
     pN = _pad_to(N_orig, _PAD_N)
     pK = _pad_to(K_orig, _PAD_K)
@@ -213,7 +246,6 @@ def int8_gemm_dequant_impl(
         b_transposed.stride(0), b_transposed.stride(1),
         c.stride(0), c.stride(1),
         HAS_BIAS=has_bias,
-        multibuffer=True,
     )
 
     return c[:M_orig, :N_orig]
