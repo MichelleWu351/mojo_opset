@@ -127,17 +127,17 @@ def test_reject_sampler(batch_size, vocab_size, spec_step):
 @bypass_not_implemented
 def test_join_prob_reject_sampler(batch_size, vocab_size, spec_step):
     torch.manual_seed(42)
-    target_logits = torch.randn((batch_size, 1 + spec_step, vocab_size), dtype=torch.float32)
+    target_probs = torch.softmax(torch.randn((batch_size, 1 + spec_step, vocab_size), dtype=torch.float32), dim=-1)
     draft_tokens = torch.randint(0, vocab_size, (batch_size, spec_step))
     draft_probs = torch.ones((batch_size, spec_step), dtype=torch.float32)
 
     reject_join_prob_sampling = MojoJoinProbRejectSampling()
     ref_join_prob_sampling = MojoJoinProbRejectSampling._registry.get("torch")()
 
-    batch_size = target_logits.shape[0]
+    batch_size = target_probs.shape[0]
 
-    ref_token_ids, ref_accept_len = ref_join_prob_sampling(target_logits, draft_tokens, draft_probs, 42)
-    ttx_token_ids, ttx_accept_len = reject_join_prob_sampling(target_logits, draft_tokens, draft_probs, 42)
+    ref_token_ids, ref_accept_len = ref_join_prob_sampling(target_probs, draft_tokens, draft_probs, 42)
+    ttx_token_ids, ttx_accept_len = reject_join_prob_sampling(target_probs, draft_tokens, draft_probs, 42)
 
     range_mask = torch.arange(spec_step + 1).expand(batch_size, -1).to(ref_accept_len.device)
 
