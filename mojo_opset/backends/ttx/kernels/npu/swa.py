@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from .utils import get_num_cores
+from .utils import is_910
 
 AUX_MASK_SIZE = 256
 AUX_MASK = None
@@ -198,7 +199,7 @@ def _swa_transposed_range_blocks(
         cur_q_end = q_seq_len
 
     start_block = cur_q_start // BLOCK_SIZE_M
-    end_block = tl.cdiv(cur_q_end, BLOCK_SIZE_M)
+    end_block = min(tl.cdiv(cur_q_end, BLOCK_SIZE_M), tl.cdiv(q_seq_len, BLOCK_SIZE_M))
     return start_block, end_block
 
 
@@ -1884,8 +1885,8 @@ def _sdpa_single_block_bwd_dq(
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": BM, "BLOCK_N": BN, "multibuffer": MF})
-        for BM in [128]
-        for BN in [128]
+        for BM in ([128] if not is_910() else [64, 128])
+        for BN in ([128] if not is_910() else [64, 128])
         for MF in [False, True]
     ],
     key=["HEAD_DIM"],
@@ -2401,6 +2402,7 @@ def swa_bwd_impl(
     cube_num = get_num_cores("cube")
 
     grid = (cube_num,)
+    unit_flag = not is_910()
 
     _swa_bwd_dkdv_kernel[grid](
         dk,
@@ -2450,7 +2452,7 @@ def swa_bwd_impl(
         BLOCK_D,
         limit_auto_multi_buffer_buffer="no-limit",
         hfusion_enable_multiple_consumer_fusion=True,
-        unit_flag=True,
+        unit_flag=unit_flag,
         limit_auto_multi_buffer_of_local_buffer="no-l0c",
         intra_cache_num=1,
     )
@@ -2498,7 +2500,7 @@ def swa_bwd_impl(
         BLOCK_D,
         limit_auto_multi_buffer_buffer="no-limit",
         hfusion_enable_multiple_consumer_fusion=True,
-        unit_flag=True,
+        unit_flag=unit_flag,
         limit_auto_multi_buffer_of_local_buffer="no-l0c",
         intra_cache_num=3,
         inter_cache_num=2,
