@@ -906,7 +906,7 @@ def sdpa_fwd_impl(
     o = torch.empty_like(q)
     lse = torch.zeros((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
     num_cores, _ = get_device_properties()
-    print("=================================kernel_sdpa_fwd====")
+
     kernel_sdpa_fwd[(num_cores,)](
         q,
         k,
