@@ -8,7 +8,8 @@ from mojo_opset.backends.ttx.kernels.npu.utils import VEC_ALIGN_BYTES
 from mojo_opset.backends.ttx.kernels.utils import align, ceil_div, torch_to_triton_dtype
 
 COL_BLOCKING_THRESHOLD = 2048
-
+SINGLE_PASS_THRESHOLD = 2048
+TWO_PASS_BLOCK_SIZE_N = 4096
 TOKEN_BLOCK_SIZE_TABLE = {
     2048: 4,
     1024: 8,
@@ -65,7 +66,19 @@ def layer_norm_fwd_heuristics(args):
     return 4
 
 
-@triton.heuristics({"BLOCK_SIZE_M": layer_norm_fwd_heuristics})
+def layer_norm_fwd_two_pass_heuristics(args):
+    hidden_dim = args["n_cols"]
+    if hidden_dim <= COL_BLOCKING_THRESHOLD:
+        if hidden_dim in TOKEN_BLOCK_SIZE_TABLE:
+            return TOKEN_BLOCK_SIZE_TABLE[hidden_dim]
+        for dim_thresh, block_size in sorted(TOKEN_BLOCK_SIZE_TABLE.items()):
+            if hidden_dim <= dim_thresh:
+                return block_size
+        return 1
+    else:
+        return 2
+
+
 @libentry()
 @triton.jit
 def _layernorm_fwd_kernel(
@@ -79,11 +92,12 @@ def _layernorm_fwd_kernel(
     stride_y_row,
     n_rows,
     n_cols,
-    eps,
+    eps: tl.constexpr,
     DROP_COLS_MASK: tl.constexpr,
     DROP_ROWS_MASK: tl.constexpr,
     STORE_STATS: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_N_PASS1: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -104,8 +118,8 @@ def _layernorm_fwd_kernel(
         X_ptr_row_block = X_ptr + rows_off[:, None] * stride_x_row
         Y_ptr_row_block = Y_ptr + rows_off[:, None] * stride_y_row
 
-        for col_offset in range(0, n_cols, BLOCK_SIZE_N):
-            cols_off = col_offset + tl.arange(0, BLOCK_SIZE_N)
+        for col_offset in range(0, n_cols, BLOCK_SIZE_N_PASS1):
+            cols_off = col_offset + tl.arange(0, BLOCK_SIZE_N_PASS1)
 
             if DROP_ROWS_MASK:
                 if DROP_COLS_MASK:
@@ -214,7 +228,7 @@ def _layernorm_fwd_single_pass_kernel(
     stride_y_row,
     n_rows,
     n_cols,
-    eps,
+    eps: tl.constexpr,
     DROP_COLS_MASK: tl.constexpr,
     DROP_ROWS_MASK: tl.constexpr,
     STORE_STATS: tl.constexpr,
@@ -507,13 +521,15 @@ def _launch_layernorm_fwd_kernel(
     block_size_n,
     store_stats: bool,
 ):
-    block_size_m = layer_norm_fwd_heuristics(
-        {"n_rows": n_rows, "n_cols": n_cols, "x_dtype": x_2d.dtype}
+    block_size_m = layer_norm_fwd_two_pass_heuristics(
+        {"n_cols": n_cols}
     )
     drop_cols_mask = n_cols % block_size_n == 0
     drop_rows_mask = n_rows % block_size_m == 0
-    use_single_pass = n_cols <= block_size_n
-    grid = _layernorm_fwd_grid(n_rows, n_cols, x_2d.dtype)
+    block_size_n_pass1 = 8192 if n_cols <= 8192 else TWO_PASS_BLOCK_SIZE_N
+    use_single_pass = n_cols <= SINGLE_PASS_THRESHOLD
+    num_programs = get_num_cores()
+    grid = (num_programs,)
 
     if use_single_pass:
         _layernorm_fwd_single_pass_kernel[grid](
@@ -551,6 +567,8 @@ def _launch_layernorm_fwd_kernel(
         DROP_ROWS_MASK=drop_rows_mask,
         STORE_STATS=store_stats,
         BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_N_PASS1=block_size_n_pass1,
+        BLOCK_SIZE_M=block_size_m,
     )
 
 
@@ -565,10 +583,10 @@ def layernorm_infer_impl(
     x_2d = hidden_states.reshape(-1, dim)
     n_rows, n_cols = x_2d.shape
 
-    if n_cols > COL_BLOCKING_THRESHOLD:
-        BLOCK_SIZE_N = 2048
+    if n_cols <= SINGLE_PASS_THRESHOLD:
+        BLOCK_SIZE_N = triton.next_power_of_2(n_cols)
     else:
-        BLOCK_SIZE_N = align(hidden_states, n_cols, VEC_ALIGN_BYTES)
+        BLOCK_SIZE_N = TWO_PASS_BLOCK_SIZE_N
 
     y = torch.empty_like(x_2d)
 
@@ -595,10 +613,10 @@ def layernorm_fwd_impl(x, w, b, eps):
     x_2d = x.reshape(-1, dim)
     n_rows, n_cols = x_2d.shape
 
-    if n_cols > COL_BLOCKING_THRESHOLD:
-        BLOCK_SIZE_N = 2048
+    if n_cols  <= SINGLE_PASS_THRESHOLD:
+        BLOCK_SIZE_N = triton.next_power_of_2(n_cols)
     else:
-        BLOCK_SIZE_N = align(x, n_cols, VEC_ALIGN_BYTES)
+        BLOCK_SIZE_N = TWO_PASS_BLOCK_SIZE_N
 
     y = torch.empty_like(x_2d)
     mean = torch.empty(n_rows, dtype=torch.float32, device=x.device)
@@ -618,7 +636,7 @@ def layernorm_bwd_impl(dy, x_2d, w, b, mean, rstd):
     n_rows, n_cols = dy_2d.shape
 
     if n_cols > COL_BLOCKING_THRESHOLD:
-        BLOCK_SIZE_N = 2048
+        BLOCK_SIZE_N = TWO_PASS_BLOCK_SIZE_N
     else:
         BLOCK_SIZE_N = align(x_2d, n_cols, VEC_ALIGN_BYTES)
 
