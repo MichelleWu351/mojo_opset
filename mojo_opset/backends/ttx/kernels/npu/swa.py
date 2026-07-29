@@ -356,10 +356,9 @@ def _sdpa_infer_kernel(
     stride_vt,
     stride_vh,
     stride_vd,
-    aux_mask_ptr,
-    aux_mask_size,
-    stride_mask_m,
-    stride_mask_n,
+    causal_mask_ptr,
+    causal_mask_m_size: tl.constexpr,
+    causal_mask_n_size: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     GLOBAL_WINDOW: tl.constexpr,
     LOCAL_WINDOW: tl.constexpr,
@@ -374,17 +373,6 @@ def _sdpa_infer_kernel(
     tl.static_assert(HEAD_DIM <= BLOCK_D, "BLOCK_SIZE_D should not be less than HEAD_DIM")
     pid = tl.program_id(0)
     n_programs = tl.num_programs(0)
-
-    # Hint(chenyifan):
-    #   the prepared aux_mask is [[empty, triu, full, tril, empty],
-    #                             [full, empty, empty, full, empty]]
-    #   every mask [BLOCK_M, BLOCK_N] can be sliced from the aux_mask and further combined
-    aux_mask_ptr_01 = aux_mask_ptr + aux_mask_size * 1 * stride_mask_m + aux_mask_size * 3 * stride_mask_n
-    aux_mask_ptr_10 = aux_mask_ptr + aux_mask_size * 1 * stride_mask_m + aux_mask_size * 1 * stride_mask_n
-    aux_mask_ptr_triu = aux_mask_ptr + aux_mask_size * 1 * stride_mask_n
-    aux_mask_ptr_tril = aux_mask_ptr + aux_mask_size * 3 * stride_mask_n
-    aux_mask_ptr_01t = aux_mask_ptr + aux_mask_size * 1 * stride_mask_m
-    aux_mask_ptr_10t = aux_mask_ptr + aux_mask_size * 1 * stride_mask_m + aux_mask_size * 2 * stride_mask_n
 
     cu_q_chunks = 0
     for b_id in range(bsz):
@@ -409,53 +397,11 @@ def _sdpa_infer_kernel(
             else:
                 kv_head_id = q_head_id // (NUM_Q_HEADS // NUM_KV_HEADS)
 
-            # q_block_ptr = tl.make_block_ptr(
-            #     base=q_ptr + q_start * stride_qt + q_head_id * stride_qh,
-            #     shape=(q_seq_len, HEAD_DIM),
-            #     strides=(stride_qt, stride_qd),
-            #     offsets=(0, 0),
-            #     block_shape=(BLOCK_M, BLOCK_D),
-            #     order=(1, 0),
-            # )
-            # o_block_ptr = tl.make_block_ptr(
-            #     base=o_ptr + q_start * stride_ot + q_head_id * stride_oh,
-            #     shape=(q_seq_len, HEAD_DIM),
-            #     strides=(stride_ot, stride_od),
-            #     offsets=(0, 0),
-            #     block_shape=(BLOCK_M, BLOCK_D),
-            #     order=(1, 0),
-            # )
-            # k_block_ptr = tl.make_block_ptr(
-            #     base=k_ptr + kv_start * stride_kt + kv_head_id * stride_kh,
-            #     shape=(kv_seq_len, HEAD_DIM),
-            #     strides=(stride_kt, stride_kd),
-            #     offsets=(0, 0),
-            #     block_shape=(BLOCK_N, BLOCK_D),
-            #     order=(1, 0),
-            # )
-            # v_block_ptr = tl.make_block_ptr(
-            #     base=v_ptr + kv_start * stride_vt + kv_head_id * stride_vh,
-            #     shape=(kv_seq_len, HEAD_DIM),
-            #     strides=(stride_vt, stride_vd),
-            #     offsets=(0, 0),
-            #     block_shape=(BLOCK_N, BLOCK_D),
-            #     order=(1, 0),
-            # )
-            q_mask = gen_mask_m_right_bound(
-                aux_mask_ptr_10t,
-                aux_mask_size,
-                stride_mask_m,
-                stride_mask_n,
-                BLOCK_M,
-                BLOCK_N,
-                q_block_id * BLOCK_M,
-                q_seq_len,
-            )
             q_block_start = q_block_id * BLOCK_M
             q_block_end = min(q_block_start + BLOCK_M, q_seq_len)
             q_block_len = q_block_end - q_block_start
+            q_mask = (q_block_start + tl.arange(0, BLOCK_M)[:, None]) < q_seq_len
 
-            # cur_q_block_ptr = tl.advance(q_block_ptr, (q_block_start.to(tl.int32), 0))
             cur_q_block_ptr = tl.make_block_ptr(
                 base=q_ptr + q_start * stride_qt + q_head_id * stride_qh,
                 shape=(q_seq_len, HEAD_DIM),
@@ -480,57 +426,32 @@ def _sdpa_infer_kernel(
                 LOCAL_WINDOW,
             )
 
-            for kv_block_id in range(num_global_window_blocks):
+            num_blocks_to_process = num_global_window_blocks + (num_total_blocks - non_global_window_start_block)
+
+            for idx in range(0, num_blocks_to_process):
+                is_non_global = (idx >= num_global_window_blocks).to(tl.int32)
+                kv_block_id = idx + is_non_global * (non_global_window_start_block - num_global_window_blocks)
                 kv_block_start = kv_block_id * BLOCK_N
-                kv_mask = gen_mask_n_right_bound(
-                    aux_mask_ptr_10,
-                    aux_mask_size,
-                    stride_mask_m,
-                    stride_mask_n,
-                    BLOCK_M,
-                    BLOCK_N,
-                    kv_block_start,
-                    kv_seq_len,
-                )
+                kv_mask = (kv_block_start + tl.arange(0, BLOCK_N)[None, :]) < kv_seq_len
+
                 if IS_CAUSAL:
-                    # actually, it must be true for global window blocks
-                    mask_gw = gen_mask_n_right_bound(
-                        aux_mask_ptr_10,
-                        aux_mask_size,
-                        stride_mask_m,
-                        stride_mask_n,
+                    q_pos = q_block_start + kv_computed_len
+                    mask = gen_mask_causal_with_window(
+                        causal_mask_ptr,
+                        causal_mask_m_size,
+                        causal_mask_n_size,
                         BLOCK_M,
                         BLOCK_N,
+                        q_pos,
                         kv_block_start,
                         GLOBAL_WINDOW,
+                        LOCAL_WINDOW,
+                        q_seq_len,
+                        kv_seq_len,
                     )
-                    if LOCAL_WINDOW is not None:
-                        mask_sw = gen_mask_triu(
-                            aux_mask_ptr_triu,
-                            aux_mask_size,
-                            stride_mask_m,
-                            stride_mask_n,
-                            BLOCK_M,
-                            BLOCK_N,
-                            q_block_start + kv_computed_len,
-                            kv_block_start + LOCAL_WINDOW,
-                        )
-                        mask_gw = mask_gw | mask_sw
-                    mask_causal = gen_mask_tril(
-                        aux_mask_ptr_tril,
-                        aux_mask_size,
-                        stride_mask_m,
-                        stride_mask_n,
-                        BLOCK_M,
-                        BLOCK_N,
-                        q_block_start + kv_computed_len,
-                        kv_block_start,
-                    )
-                    mask_causal = mask_gw & mask_causal
-                    mask = mask_causal & q_mask & kv_mask
                 else:
                     mask = q_mask & kv_mask
-                # cur_k_block_ptr = tl.advance(k_block_ptr, (kv_block_start.to(tl.int32), 0))
+
                 cur_k_block_ptr = tl.make_block_ptr(
                     base=k_ptr + kv_start * stride_kt + kv_head_id * stride_kh,
                     shape=(kv_seq_len, HEAD_DIM),
@@ -539,7 +460,6 @@ def _sdpa_infer_kernel(
                     block_shape=(BLOCK_N, BLOCK_D),
                     order=(1, 0),
                 )
-                # cur_v_block_ptr = tl.advance(v_block_ptr, (kv_block_start.to(tl.int32), 0))
                 cur_v_block_ptr = tl.make_block_ptr(
                     base=v_ptr + kv_start * stride_vt + kv_head_id * stride_vh,
                     shape=(kv_seq_len, HEAD_DIM),
@@ -565,80 +485,6 @@ def _sdpa_infer_kernel(
                     v_ptr.dtype.element_ty == tl.float8e5,
                 )
 
-            for kv_block_id in range(non_global_window_start_block, num_total_blocks):
-                kv_block_start = kv_block_id * BLOCK_N
-                kv_mask = gen_mask_n_right_bound(
-                    aux_mask_ptr_10,
-                    aux_mask_size,
-                    stride_mask_m,
-                    stride_mask_n,
-                    BLOCK_M,
-                    BLOCK_N,
-                    kv_block_start,
-                    kv_seq_len,
-                )
-                if IS_CAUSAL:
-                    mask_causal = gen_mask_tril(
-                        aux_mask_ptr_tril,
-                        aux_mask_size,
-                        stride_mask_m,
-                        stride_mask_n,
-                        BLOCK_M,
-                        BLOCK_N,
-                        q_block_start + kv_computed_len,
-                        kv_block_start,
-                    )
-                    if LOCAL_WINDOW is not None:
-                        mask_sw = gen_mask_triu(
-                            aux_mask_ptr_triu,
-                            aux_mask_size,
-                            stride_mask_m,
-                            stride_mask_n,
-                            BLOCK_M,
-                            BLOCK_N,
-                            q_block_start + kv_computed_len,
-                            kv_block_start + LOCAL_WINDOW,
-                        )
-                        mask_causal = mask_causal & mask_sw
-
-                    mask = mask_causal & q_mask & kv_mask
-                else:
-                    mask = q_mask & kv_mask
-                # cur_k_block_ptr = tl.advance(k_block_ptr, (kv_block_start.to(tl.int32), 0))
-                cur_k_block_ptr = tl.make_block_ptr(
-                    base=k_ptr + kv_start * stride_kt + kv_head_id * stride_kh,
-                    shape=(kv_seq_len, HEAD_DIM),
-                    strides=(stride_kt, stride_kd),
-                    offsets=(kv_block_start.to(tl.int32), 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
-                )
-                # cur_v_block_ptr = tl.advance(v_block_ptr, (kv_block_start.to(tl.int32), 0))
-                cur_v_block_ptr = tl.make_block_ptr(
-                    base=v_ptr + kv_start * stride_vt + kv_head_id * stride_vh,
-                    shape=(kv_seq_len, HEAD_DIM),
-                    strides=(stride_vt, stride_vd),
-                    offsets=(kv_block_start.to(tl.int32), 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
-                )
-                acc, l_i, m_i = _sdpa_acc_fwd_MxN(
-                    acc,
-                    l_i,
-                    m_i,
-                    cur_q_block,
-                    cur_k_block_ptr,
-                    cur_v_block_ptr,
-                    mask,
-                    scale,
-                    HEAD_DIM,
-                    BLOCK_M,
-                    BLOCK_N,
-                    BLOCK_D,
-                    v_ptr.dtype.element_ty == tl.float8e5,
-                )
-
-            # cur_o_block_ptr = tl.advance(o_block_ptr, (q_block_start.to(tl.int32), 0))
             cur_o_block_ptr = tl.make_block_ptr(
                 base=o_ptr + q_start * stride_ot + q_head_id * stride_oh,
                 shape=(q_seq_len, HEAD_DIM),
@@ -663,7 +509,17 @@ def swa_infer_impl(
     softmax_scale: Optional[float] = None,
     gqa_interleave: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    mask_size, mask = get_aux_mask()
+    if global_window_size is None:
+        global_window_size = 0
+
+    causal_mask = get_mask_causal_with_window(
+        256,
+        256,
+        local_window_size,
+        global_window_size,
+    )
+    causal_mask_m_size, causal_mask_n_size = causal_mask.shape
+
     bsz = cu_q_lens.shape[0] - 1
     tot_q_toks, num_q_heads, head_dim = q.shape
     tot_kv_toks, num_kv_heads, _ = k.shape
@@ -705,10 +561,9 @@ def swa_infer_impl(
         v.stride(0),
         v.stride(1),
         v.stride(2),
-        mask,
-        mask_size,
-        mask.stride(0),
-        mask.stride(1),
+        causal_mask,
+        causal_mask_m_size,
+        causal_mask_n_size,
         is_causal,
         global_window_size,
         local_window_size,
@@ -720,6 +575,11 @@ def swa_infer_impl(
         BLOCK_N,
         BLOCK_D,
         enable_ubuf_saving=True,
+        limit_auto_multi_buffer_of_local_buffer="no-l0c",
+        limit_auto_multi_buffer_buffer="no-limit",
+        hfusion_enable_multiple_consumer_fusion=True,
+        intra_cache_num=3,
+        inter_cache_num=2,
     )
     return o
 

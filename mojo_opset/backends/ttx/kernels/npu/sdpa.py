@@ -414,16 +414,18 @@ def kernel_sdpa_fwd(
             block_v = tl.load(ptr_v, mask=mask_kv, other=0.0)
 
             block_s = tl.dot(block_q, tl.trans(block_k)) * scale
-            block_s -= (1.0 - block_mask.to(HIGH_TYPE)) * 1e6
+            block_s = tl.where(block_mask, block_s, -1e6)
             block_m_1 = tl.maximum(block_m, tl.max(block_s, axis=1,
-                                   propagate_nan=tl.PropagateNan.ALL),propagate_nan=tl.PropagateNan.ALL)
-            block_s = tl.exp(block_s - block_m_1[:, None])
-            block_l_1 = tl.exp(block_m - block_m_1) * block_l + tl.sum(block_s, axis=1)
-            block_o = tl.exp(block_m - block_m_1)[:, None] * block_o + tl.dot(block_s.to(LOW_TYPE), block_v).to(
-                HIGH_TYPE
-            )
+                                                   propagate_nan=tl.PropagateNan.ALL),
+                                   propagate_nan=tl.PropagateNan.ALL)
+            block_s = tl.math.exp(block_s - block_m_1[:, None])
+            block_l_1= tl.sum(block_s, axis=1)
+            alpha = tl.math.exp(block_m - block_m_1)
+            block_l = alpha * block_l + block_l_1
+            block_o = block_o * alpha[:, None]
+            block_o = tl.dot(block_s.to(LOW_TYPE), block_v, block_o).to(HIGH_TYPE)
             block_m = block_m_1
-            block_l = block_l_1
+
 
         block_o = block_o / block_l[:, None]
         block_lse = tl.log(block_l) + block_m
@@ -617,8 +619,8 @@ def kernel_sdpa_bwd_q(
             block_s -= (1.0 - block_mask.to(HIGH_TYPE)) * 1e6
             block_p = tl.exp(block_s - block_lse[:, None])
             block_dp = tl.dot(block_do, block_v.T).to(HIGH_TYPE)
-            block_ds = block_p * (block_dp - block_d[:, None])
-            block_dq += tl.dot(block_ds.to(LOW_TYPE), block_k).to(HIGH_TYPE) * scale
+            block_ds = block_p * (block_dp - block_d[:, None]) * scale
+            block_dq += tl.dot(block_ds.to(LOW_TYPE), block_k).to(HIGH_TYPE)
 
         tl.store(ptr_dq, block_dq.to(LOW_TYPE), mask=mask_q)
 
@@ -768,8 +770,8 @@ def kernel_sdpa_bwd_kv(
                 block_p = tl.exp(block_s - block_lse[:, None])
                 block_dv += tl.dot(block_p.to(LOW_TYPE).T, block_do).to(HIGH_TYPE)
                 block_dp = tl.dot(block_do, block_v.T).to(HIGH_TYPE)
-                block_ds = block_p * (block_dp - block_d[:, None])
-                block_dk += tl.dot(block_ds.to(LOW_TYPE).T, block_q).to(HIGH_TYPE) * scale
+                block_ds = block_p * (block_dp - block_d[:, None]) * scale
+                block_dk += tl.dot(block_ds.to(LOW_TYPE).T, block_q).to(HIGH_TYPE)
 
         tl.store(ptr_dk, block_dk.to(LOW_TYPE), mask=mask_kv)
         tl.store(ptr_dv, block_dv.to(LOW_TYPE), mask=mask_kv)
@@ -857,6 +859,7 @@ def sdpa_infer_impl(
         set_workspace_multibuffer=4,
         tile_mix_vector_loop=8,
         tile_mix_cube_loop=4,
+        limit_auto_multi_buffer_buffer="no-limit",
         enable_dynamic_cv_pipeline=True,
         enable_cube_block_merge=True,
         hfusion_enable_multiple_consumer_fusion=True,
@@ -934,6 +937,7 @@ def sdpa_fwd_impl(
         lse.stride(0),
         lse.stride(1),
         lse.stride(2),
+        limit_auto_multi_buffer_buffer="no-limit",
         enable_dynamic_cv_pipeline=True,
         enable_cube_block_merge=True,
         hfusion_enable_multiple_consumer_fusion=True,
@@ -983,13 +987,13 @@ def sdpa_bwd_impl(
     assert q.shape[3] == k.shape[3] and k.shape[3] == v.shape[3] and q.shape[3] in {64, 128}
     assert q.shape[0] == lse.shape[0] and q.shape[1] == lse.shape[1] and q.shape[2] == lse.shape[2]
 
-    num_cores, _ = get_device_properties()
+    num_cores, num_vec_cores = get_device_properties()
     d = torch.empty_like(lse)
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
 
-    kernel_sdpa_bwd_d[(num_cores,)](
+    kernel_sdpa_bwd_d[(num_vec_cores,)](
         o,
         do,
         d,
@@ -1035,6 +1039,11 @@ def sdpa_bwd_impl(
         d.stride(0),
         d.stride(1),
         d.stride(2),
+        limit_auto_multi_buffer_buffer="no-limit",
+        hfusion_enable_multiple_consumer_fusion=True,
+        unit_flag=True,
+        limit_auto_multi_buffer_of_local_buffer="no-l0c",
+        intra_cache_num=1,
     )
     kernel_sdpa_bwd_kv[(num_cores,)](
         q,
@@ -1067,6 +1076,12 @@ def sdpa_bwd_impl(
         d.stride(0),
         d.stride(1),
         d.stride(2),
+        limit_auto_multi_buffer_buffer="no-limit",
+        hfusion_enable_multiple_consumer_fusion=True,
+        unit_flag=True,
+        limit_auto_multi_buffer_of_local_buffer="no-l0c",
+        intra_cache_num=3,
+        inter_cache_num=2,
     )
 
     return dq, dk, dv
