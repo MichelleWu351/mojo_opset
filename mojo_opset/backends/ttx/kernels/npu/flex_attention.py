@@ -1778,7 +1778,6 @@ def flex_attention_fwd_impl(
         enable_cross_if_fusion=True,
         enable_buffer_insert_optimization=True,
         enable_ub_refine_opt = True,
-        enable_vf_operand_substitution=True,
     )
 
     return output, lse
