@@ -24,42 +24,22 @@ TOKEN_BLOCK_SIZE_TABLE = {
 }
 
 
-def rms_norm_fwd_heuristics(args):
-    hidden_dim = args["n_cols"]
-    n_rows = args["n_rows"] if "n_rows" in args else 0
-
-    if hidden_dim >= 8192:
-        return 1
-    if hidden_dim >= 4096:
-        return 2
-    if hidden_dim >= 2048:
-        return 4
-    if hidden_dim >= 1024:
-        return 8
-    if hidden_dim >= 512:
-        return 16
-
-    if hidden_dim <= 128:
-        if n_rows > 0 and n_rows <= 32:
-            return 4
-        return 32
-
-    if hidden_dim <= COL_BLOCKING_THRESHOLD:
-        if hidden_dim in TOKEN_BLOCK_SIZE_TABLE:
-            return TOKEN_BLOCK_SIZE_TABLE[hidden_dim]
-
-        for dim_thresh, block_size in sorted(TOKEN_BLOCK_SIZE_TABLE.items()):
-            if hidden_dim <= dim_thresh:
-                return block_size
-        return 1
-    return 4
-
-
 def _num_vectorcores():
     return get_num_cores("vector")
 
 
-@triton.heuristics({"BLOCK_SIZE_M": rms_norm_fwd_heuristics})
+def _block_size_n_heur(args):
+    n_cols = args["n_cols"]
+    if n_cols <= 1024:
+        return 1024
+    elif n_cols <= 2048:
+        return 2048
+    elif n_cols <= 4096:
+        return 4096
+    else:
+        return 8192
+
+
 @libentry()
 @triton.jit
 def _fused_add_rmsnorm_fwd_kernel(
@@ -257,7 +237,6 @@ def _fused_add_rmsnorm_fwd_kernel(
                 tl.store(Y_ptr_row_block + cols_off[None, :], Y_chunk, mask=block_mask)
 
 
-@triton.heuristics({"BLOCK_SIZE_M": rms_norm_fwd_heuristics})
 @libentry()
 @triton.jit
 def _fused_add_rmsnorm_fwd_single_pass_kernel(
@@ -521,10 +500,7 @@ def fused_add_rmsnorm_infer_impl(
     residual_2d = residual.reshape(-1, dim)
     n_rows, n_cols = hidden_states_2d.shape
 
-    if n_cols > COL_BLOCKING_THRESHOLD:
-        BLOCK_SIZE_N = 2048
-    else:
-        BLOCK_SIZE_N = align(hidden_states, n_cols, VEC_ALIGN_BYTES)
+    BLOCK_SIZE_N = _block_size_n_heur({"n_cols": n_cols})
 
     str_to_casting_mode = {"llama": 0, "gemma": 1, "none": -1}
     _casting_mode = str_to_casting_mode[casting_mode]
@@ -532,7 +508,7 @@ def fused_add_rmsnorm_infer_impl(
     rstd_dtype = torch.float32 if _casting_mode in (0, 1) else hidden_states.dtype
     RSTD = torch.empty(n_rows, dtype=rstd_dtype, device=hidden_states.device)
 
-    BLOCK_SIZE_M = rms_norm_fwd_heuristics({"n_rows": n_rows, "n_cols": n_cols})
+    BLOCK_SIZE_M = max(1, min(8, ceil_div(4096, n_cols)))
     num_row_tasks = ceil_div(n_rows, BLOCK_SIZE_M)
     grid = (max(1, min(_num_vectorcores(), num_row_tasks)),)
 
@@ -564,6 +540,7 @@ def fused_add_rmsnorm_infer_impl(
             STORE_RSTD=True,
             DROP_COLS_MASK=drop_cols_mask,
             DROP_ROWS_MASK=drop_rows_mask,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             sync_solver=True,
         )
@@ -595,6 +572,7 @@ def fused_add_rmsnorm_infer_impl(
         STORE_RSTD=True,
         DROP_COLS_MASK=drop_cols_mask,
         DROP_ROWS_MASK=drop_rows_mask,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         sync_solver=True,
     )
