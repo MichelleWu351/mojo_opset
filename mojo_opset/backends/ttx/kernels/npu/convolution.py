@@ -51,7 +51,7 @@ def causal_conv1d_fwd_kernel(
     IS_VARLEN: tl.constexpr,
     NUM_CHKS: tl.int32,
 ):
-    NUM_BLKS_D = triton.cdiv(D, BD)
+    NUM_BLKS_D = tl.cdiv(D, BD)
     pid = tl.program_id(0)
     num_programs = tl.num_programs(0)
 

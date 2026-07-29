@@ -215,7 +215,10 @@ def rmsnorm_infer_impl(
     y = torch.empty_like(X_2d)
 
     if n_cols > COL_BLOCKING_THRESHOLD:
-        BLOCK_SIZE_N = COL_BLOCKING_THRESHOLD
+        if n_cols * 8 <= 200000:
+            BLOCK_SIZE_N = n_cols # only load X for once
+        else:
+            BLOCK_SIZE_N = COL_BLOCKING_THRESHOLD # load X for twice
     else:
         BLOCK_SIZE_N = align(x, n_cols, VEC_ALIGN_BYTES)
 
