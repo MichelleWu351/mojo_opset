@@ -521,7 +521,7 @@ def fused_add_rmsnorm_infer_impl(
     residual_2d = residual.reshape(-1, dim)
     n_rows, n_cols = hidden_states_2d.shape
 
-    if n_cols > COL_BLOCKING_THRESHOLD:
+    if COL_BLOCKING_THRESHOLD < n_cols < 8192:
         BLOCK_SIZE_N = 2048
     else:
         BLOCK_SIZE_N = align(hidden_states, n_cols, VEC_ALIGN_BYTES)
